@@ -22,6 +22,7 @@ import card_db
 import economy
 import security
 import squad_logic as sl
+from squad_image import build_team_image, FILENAME as TEAM_IMG_NAME
 from card_narratives import ROLES, HANDS
 from security import OwnedView, esc
 
@@ -56,7 +57,7 @@ def _in_match(bot, user_id: int) -> bool:
 
 
 async def _need_debut(ctx: commands.Context) -> bool:
-    if await asyncio.to_thread(economy.user_exists, ctx.author.id):
+    if economy.user_exists(ctx.author.id):
         return True
     await ctx.send("❌ You haven't debuted yet. Type `csdebut` first.")
     return False
@@ -81,7 +82,7 @@ def _xi_embed(member: discord.abc.User, user_row) -> discord.Embed:
         if card is None:
             lines.append(f"`{slot:>2}.` — empty —")
             continue
-        badge = " ©️" if card["playername_key"] == cap_key else ""
+        badge = " <:Captain:1558139695177932951>" if card["playername_key"] == cap_key else ""
         lines.append(
             f"`{slot:>2}.` {sl.card_emoji(card)} **{esc(card['playername'])}** · "
             f"{card['ovr']} · {ROLES.get(card_db.effective_role(card), '?')}{badge}"
@@ -98,14 +99,6 @@ def _xi_embed(member: discord.abc.User, user_row) -> discord.Embed:
         + (f" • ⚠️ {problem}" if problem else " • ✅ Ready to play")
     ))
     return embed
-
-
-async def _xi_embed_async(member: discord.abc.User, user_id: int | None = None, user_row=None) -> discord.Embed:
-    """Build the XI embed (several DB reads) in a worker thread."""
-    def _build():
-        row = user_row if user_row is not None else economy.get_user(user_id)
-        return _xi_embed(member, row)
-    return await asyncio.to_thread(_build)
 
 
 # ── Squad list with page buttons ─────────────────────────────────────────────
@@ -128,7 +121,7 @@ class SquadView(OwnedView):
             for c in chunk
         ] or ["No players yet."]
         embed = discord.Embed(
-            title=f"📋 {esc(self.owner_name)} — Squad ({len(self.cards)} players)",
+            title=f"<:Squademoji:1558139700156571801> {esc(self.owner_name)} — Squad ({len(self.cards)} players)",
             description="\n".join(lines),
             color=discord.Color.green(),
         )
@@ -199,13 +192,12 @@ class AutoXiView(ui.View):
         if _in_match(interaction.client, self.owner_id):
             await interaction.response.send_message("❌ You can't change your XI during a match.", ephemeral=True)
             return
-        await interaction.response.defer()
-        err = await asyncio.to_thread(_apply_auto_xi, self.owner_id)
+        err = _apply_auto_xi(self.owner_id)
         if err:
-            await interaction.followup.send(err, ephemeral=True)
+            await interaction.response.send_message(err, ephemeral=True)
             return
-        await interaction.edit_original_response(
-            embed=await _xi_embed_async(interaction.user, self.owner_id), view=self
+        await interaction.response.edit_message(
+            embed=_xi_embed(interaction.user, economy.get_user(self.owner_id)), view=self
         )
 
 
@@ -243,13 +235,13 @@ class SquadCog(commands.Cog, name="Squad"):
             await ctx.send(f"❌ {opponent.display_name} is already in a match.")
             return
         for who, label in ((challenger, "You"), (opponent, opponent.display_name)):
-            if not await asyncio.to_thread(economy.user_exists, who.id):
+            if not economy.user_exists(who.id):
                 await ctx.send(f"❌ {label} must debut first. Use `csdebut`.")
                 return
             # Checks both the general XI rules AND whether this player has
             # enough distinct bowling options to legally cover a match of
             # THIS length (a 4-bowler XI is fine for 1 over, not for 20).
-            problem = await asyncio.to_thread(sl.xi_problem_for_match, who.id, overs)
+            problem = sl.xi_problem_for_match(who.id, overs)
             if problem:
                 await ctx.send(f"❌ {label} {problem}.")
                 return
@@ -258,11 +250,13 @@ class SquadCog(commands.Cog, name="Squad"):
         # The match screens (embeds / dropdowns) work with the "team dict" form:
         # {"name", "ovr", "chem", "players": [ {name, ovr, bat, bowl, ...}, ... ]}
         for uid in (challenger.id, opponent.id):
-            game.teams[uid] = await asyncio.to_thread(sl.build_match_team, uid)
+            game.teams[uid] = sl.build_match_team(uid)
             game.team_pks[uid] = []
+            game.impact_subs_pool[uid] = sl.build_impact_subs_players(uid)
+            game.impact_used[uid] = False
 
         active_games[ctx.channel.id] = game
-        conditions = await asyncio.to_thread(random_match_conditions)
+        conditions = random_match_conditions()
         game.conditions = conditions
         game.pitch_type = conditions["pitch_type"]
         embed = build_match_invite_embed(
@@ -316,7 +310,7 @@ class SquadCog(commands.Cog, name="Squad"):
     async def csdebut(self, ctx: commands.Context):
         """Create your team."""
         default = security.clean_team_name(f"{ctx.author.display_name} XI")[0] or f"Team {ctx.author.id % 10000}"
-        if not await asyncio.to_thread(economy.create_user, ctx.author.id, default):
+        if not economy.create_user(ctx.author.id, default):
             await ctx.send("You have already debuted. Use `csprofile` to see your team.")
             return
         await ctx.send(
@@ -333,33 +327,40 @@ class SquadCog(commands.Cog, name="Squad"):
         """Claim your one-time starter squad."""
         if not await _need_debut(ctx):
             return
-        user = await asyncio.to_thread(economy.get_user, ctx.author.id)
+        user = economy.get_user(ctx.author.id)
         if user["starter_claimed"]:
             await ctx.send("You already claimed your starter pack. Try `cspack` or `csdaily`.")
             return
-        squad = await asyncio.to_thread(sl.pick_starter_squad)
+        squad = sl.pick_starter_squad()
         if squad is None:
             await ctx.send("⚠️ There aren't enough player cards in the game yet. Ask the owner to add more with `/cardmaker`.")
             return
-
-        def _starter():
-            xi_ = sl.best_xi(squad)
-            e = economy.claim_starter(
-                ctx.author.id, [c["playername_key"] for c in squad], [c["playername_key"] for c in xi_]
-            )
-            return xi_, e
-        xi, err = await asyncio.to_thread(_starter)
+        xi = sl.best_xi(squad)
+        err = economy.claim_starter(
+            ctx.author.id, [c["playername_key"] for c in squad], [c["playername_key"] for c in xi]
+        )
         if err:
             await ctx.send(f"❌ {err}")
             return
-        show_emoji = _is_premium(ctx.author)   # premium role only
-        lines = [_card_line(c, emojis=show_emoji) for c in xi]
-        bench = [c for c in squad if c not in xi]
-        embed = discord.Embed(title="🎁 Starter Pack opened!", description="\n".join(lines), color=discord.Color.gold())
-        if bench:
-            embed.add_field(name="Bench", value="\n".join(_card_line(c, emojis=show_emoji) for c in bench), inline=False)
+        team_ovr = sl.average_ovr(xi)
+        embed = discord.Embed(
+            title="🎁 Starter Pack opened!",
+            description=f"Team **{esc(user['team_name'])}** · Team OVR **{team_ovr}** · {len(xi)} players",
+            color=discord.Color.gold(),
+        )
         embed.set_footer(text="See your team: csxi • Get coins: csdaily • Buy packs: cspack")
-        await ctx.send(embed=embed)
+        buf = None
+        try:
+            buf = await asyncio.to_thread(build_team_image, xi, user["team_name"], team_ovr)
+        except Exception as e:
+            print(f"[csstarterpack] collage failed: {e}")
+        if buf is not None:
+            embed.set_image(url=f"attachment://{TEAM_IMG_NAME}")
+            await ctx.send(embed=embed, file=discord.File(buf, filename=TEAM_IMG_NAME))
+        else:   # image failed -> still show the players as text
+            show_emoji = _is_premium(ctx.author)   # premium role only
+            embed.description += "\n\n" + "\n".join(_card_line(c, emojis=show_emoji) for c in xi)
+            await ctx.send(embed=embed)
 
     # -- squad list ------------------------------------------------------
     @commands.command(name="cssquad")
@@ -370,15 +371,12 @@ class SquadCog(commands.Cog, name="Squad"):
         if target.bot:
             await ctx.send("Bots don't have squads.")
             return
-        user = await asyncio.to_thread(economy.get_user, target.id)
+        user = economy.get_user(target.id)
         if user is None:
             await ctx.send(f"**{esc(target.display_name)}** hasn't debuted yet.")
             return
-        owned, xi_map = await asyncio.to_thread(
-            lambda tid: (sl.owned_cards(tid), economy.get_xi(tid)), target.id
-        )
-        cards = sorted(owned, key=lambda c: -c["ovr"])
-        view = SquadView(ctx.author.id, user["team_name"], cards, set(xi_map.values()))
+        cards = sorted(sl.owned_cards(target.id), key=lambda c: -c["ovr"])
+        view = SquadView(ctx.author.id, user["team_name"], cards, set(economy.get_xi(target.id).values()))
         view.message = await ctx.send(embed=view.build(), view=view)
 
     # -- show a player ---------------------------------------------------
@@ -386,7 +384,7 @@ class SquadCog(commands.Cog, name="Squad"):
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def csshow(self, ctx: commands.Context, *, player: str):
         """Show a player's card and stats."""
-        card, err = await asyncio.to_thread(sl.resolve_any, security.clean_input(player))
+        card, err = sl.resolve_any(security.clean_input(player))
         if card is None:
             await ctx.send(f"❌ {err}")
             return
@@ -403,7 +401,7 @@ class SquadCog(commands.Cog, name="Squad"):
             desc += "\n\n**Playstyles**\n" + "\n".join(
                 f"• **{esc(s)}** — {esc(NARRATIVES.get(s, ''))}" for s in styles
             )
-        desc += f"\n\n💰 Buy **{economy.fmt_coins(sl.buy_price(card))}** · Sell **{economy.fmt_coins(sl.sell_value(card))}**"
+        desc += f"\n\nBuy **{economy.fmt_coins(sl.buy_price(card))}** · Sell **{economy.fmt_coins(sl.sell_value(card))}**"
         embed = discord.Embed(title=esc(card["playername"]), description=desc, color=discord.Color.gold())
         await card_cache.send_embed(ctx, embed, card["image_path"])   # cached link = no upload
 
@@ -448,6 +446,21 @@ class SquadCog(commands.Cog, name="Squad"):
         styles = await asyncio.to_thread(card_db.get_player_narratives, card["playername_key"])
         if styles:   # only cards that have a playstyle/narrative
             lines.append("Playstyle: " + " · ".join(styles))
+        # Preferred look: one image card. If anything goes wrong while drawing it,
+        # fall back to the old text embed below so csview never breaks.
+        try:
+            from csview_image import generate_view_card
+            png = await asyncio.to_thread(
+                generate_view_card,
+                card["playername"], card["ovr"], card["bat"], card["bowl"],
+                ctx.author.display_name, f"{sl.sell_value(card):,} coins",
+                bat, bowl, card["image_path"], styles,
+            )
+            await ctx.send(file=discord.File(io.BytesIO(png), filename="csview.png"))
+            return
+        except Exception as e:
+            print(f"[csview] image card failed, using text embed: {e}")
+
         embed = discord.Embed(
             title=f"Player Stats: {esc(card['playername'])}",
             description="```\n" + "\n".join(lines) + "\n\n" + table + "\n```",
@@ -522,12 +535,43 @@ class SquadCog(commands.Cog, name="Squad"):
         if target.id != ctx.author.id and not _is_premium(ctx.author):
             await ctx.send("💎 Only **Premium members** can see another player's XI. You can still use `csxi` for your own XI.")
             return
-        user = await asyncio.to_thread(economy.get_user, target.id)
+        user = economy.get_user(target.id)
         if user is None:
             await ctx.send(f"**{esc(target.display_name)}** hasn't debuted yet.")
             return
         view = AutoXiView(ctx.author.id) if target.id == ctx.author.id else None
-        await ctx.send(embed=await _xi_embed_async(target, user_row=user), view=view)
+        await ctx.send(embed=_xi_embed(target, user), view=view)
+
+    # -- XI image + team OVR ----------------------------------------------
+    @commands.command(name="csovr")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def csovr(self, ctx: commands.Context):
+        """Your real playing XI as an image, with the team OVR."""
+        if not await _need_debut(ctx):
+            return
+        user = economy.get_user(ctx.author.id)
+        cards = await asyncio.to_thread(sl.xi_cards, ctx.author.id)   # batting order, current card images
+        if not cards:
+            await ctx.send("❌ Your XI is empty. Use `csstarterpack` for your first players, or `csautoxi`.")
+            return
+        team_ovr = sl.average_ovr(cards)
+        problem = sl.xi_problem(ctx.author.id)
+        embed = discord.Embed(
+            title="🏏 Playing XI",
+            description=f"Team **{esc(user['team_name'])}** · Team OVR **{team_ovr}** · {len(cards)} players",
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text=(f"⚠️ {problem}" if problem else "✅ Ready to play") + " • Edit XI: csswap • csautoxi")
+        buf = None
+        try:
+            buf = await asyncio.to_thread(build_team_image, cards, user["team_name"], team_ovr)
+        except Exception as e:
+            print(f"[csovr] collage failed: {e}")
+        if buf is not None:
+            embed.set_image(url=f"attachment://{TEAM_IMG_NAME}")
+            await ctx.send(embed=embed, file=discord.File(buf, filename=TEAM_IMG_NAME))
+        else:   # image failed -> show the normal text XI instead
+            await ctx.send(embed=_xi_embed(ctx.author, user))
 
     @commands.command(name="csautoxi")
     @commands.cooldown(1, 10, commands.BucketType.user)
@@ -538,11 +582,11 @@ class SquadCog(commands.Cog, name="Squad"):
         if _in_match(self.bot, ctx.author.id):
             await ctx.send("❌ You can't change your XI during a match.")
             return
-        err = await asyncio.to_thread(_apply_auto_xi, ctx.author.id)
+        err = _apply_auto_xi(ctx.author.id)
         if err:
             await ctx.send(err)
             return
-        await ctx.send(embed=await _xi_embed_async(ctx.author, ctx.author.id))
+        await ctx.send(embed=_xi_embed(ctx.author, economy.get_user(ctx.author.id)))
 
     # -- autoplay (premium) ----------------------------------------------
     @commands.command(name="csautoplay")
@@ -587,7 +631,7 @@ class SquadCog(commands.Cog, name="Squad"):
         if len(parts) != 2:
             await ctx.send("Usage: `csswap 3 5` or `csswap Player One | Player Two`")
             return
-        xi = await asyncio.to_thread(economy.get_xi, ctx.author.id)
+        xi = economy.get_xi(ctx.author.id)
         keys = []
         for part in parts:
             if part.isdigit():
@@ -597,16 +641,97 @@ class SquadCog(commands.Cog, name="Squad"):
                     return
                 keys.append(xi[slot])
             else:
-                card, err = await asyncio.to_thread(sl.resolve_owned, ctx.author.id, part)
+                card, err = sl.resolve_owned(ctx.author.id, part)
                 if card is None:
                     await ctx.send(f"❌ {err}")
                     return
                 keys.append(card["playername_key"])
-        err = await asyncio.to_thread(economy.swap_players, ctx.author.id, keys[0], keys[1])
+        err = economy.swap_players(ctx.author.id, keys[0], keys[1])
         if err:
             await ctx.send(f"❌ {err}")
             return
-        await ctx.send(embed=await _xi_embed_async(ctx.author, ctx.author.id))
+        await ctx.send(embed=_xi_embed(ctx.author, economy.get_user(ctx.author.id)))
+
+    # -- impact player subs ------------------------------------------------
+    @commands.command(name="cssubs", aliases=["csimpact"])
+    @commands.cooldown(1, 4, commands.BucketType.user)
+    async def cssubs(
+        self,
+        ctx: commands.Context,
+        action: Optional[str] = None,
+        *,
+        player: Optional[str] = None,
+    ):
+        """Manage your Impact Player subs (bench players, max 4).
+        `cssubs` to view, `cssubs add <player>`, `cssubs remove <player>`, `cssubs clear`."""
+        if not await _need_debut(ctx):
+            return
+        action = (action or "list").strip().lower()
+
+        if action in ("list", "show", "view"):
+            subs = economy.get_impact_subs(ctx.author.id)
+            if not subs:
+                await ctx.send(
+                    "🔁 You have no Impact Player subs set.\n"
+                    "Add one with `cssubs add <player name>` "
+                    f"(up to {economy.IMPACT_SUBS_MAX}, must be a bench player — not already in your XI)."
+                )
+                return
+            lines = []
+            for slot in sorted(subs):
+                card = card_db.get_card(subs[slot])
+                name = card["playername"] if card else subs[slot]
+                lines.append(f"**{slot}.** {esc(name)}")
+            await ctx.send("🔁 **Your Impact Player subs:**\n" + "\n".join(lines))
+            return
+
+        if action in ("add", "set"):
+            if _in_match(self.bot, ctx.author.id):
+                await ctx.send("❌ You can't change your subs during a match.")
+                return
+            if not player:
+                await ctx.send("Usage: `cssubs add <player name>`")
+                return
+            card, err = sl.resolve_owned(ctx.author.id, security.clean_input(player))
+            if card is None:
+                await ctx.send(f"❌ {err}")
+                return
+            err = economy.add_impact_sub(ctx.author.id, card["playername_key"])
+            if err:
+                await ctx.send(f"❌ {err}")
+                return
+            await ctx.send(f"✅ **{esc(card['playername'])}** added to your Impact Player subs.")
+            return
+
+        if action in ("remove", "rem", "delete", "del"):
+            if _in_match(self.bot, ctx.author.id):
+                await ctx.send("❌ You can't change your subs during a match.")
+                return
+            if not player:
+                await ctx.send("Usage: `cssubs remove <player name>`")
+                return
+            card, err = sl.resolve_owned(ctx.author.id, security.clean_input(player))
+            if card is None:
+                await ctx.send(f"❌ {err}")
+                return
+            err = economy.remove_impact_sub(ctx.author.id, card["playername_key"])
+            if err:
+                await ctx.send(f"❌ {err}")
+                return
+            await ctx.send(f"✅ **{esc(card['playername'])}** removed from your Impact Player subs.")
+            return
+
+        if action == "clear":
+            if _in_match(self.bot, ctx.author.id):
+                await ctx.send("❌ You can't change your subs during a match.")
+                return
+            economy.clear_impact_subs(ctx.author.id)
+            await ctx.send("✅ Your Impact Player subs list is now empty.")
+            return
+
+        await ctx.send(
+            "Usage: `cssubs` (view), `cssubs add <player>`, `cssubs remove <player>`, `cssubs clear`."
+        )
 
     # -- captain ---------------------------------------------------------
     @commands.command(name="cscaptain")
@@ -618,15 +743,15 @@ class SquadCog(commands.Cog, name="Squad"):
         if _in_match(self.bot, ctx.author.id):
             await ctx.send("❌ You can't change your captain during a match.")
             return
-        card, err = await asyncio.to_thread(sl.resolve_owned, ctx.author.id, security.clean_input(player))
+        card, err = sl.resolve_owned(ctx.author.id, security.clean_input(player))
         if card is None:
             await ctx.send(f"❌ {err}")
             return
-        err = await asyncio.to_thread(economy.set_captain, ctx.author.id, card["playername_key"])
+        err = economy.set_captain(ctx.author.id, card["playername_key"])
         if err:
             await ctx.send(f"❌ {err}")
             return
-        await ctx.send(f"©️ **{esc(card['playername'])}** is now your captain.")
+        await ctx.send(f"<:Captain:1558139695177932951> **{esc(card['playername'])}** is now your captain.")
 
     # -- team name -------------------------------------------------------
     @commands.command(name="csteamname")
@@ -639,7 +764,7 @@ class SquadCog(commands.Cog, name="Squad"):
         if clean is None:
             await ctx.send(f"❌ {reason}")
             return
-        await asyncio.to_thread(economy.set_team_name, ctx.author.id, clean)
+        economy.set_team_name(ctx.author.id, clean)
         await ctx.send(f"✅ Team name changed to **{esc(clean)}**.")
 
     # -- profile ---------------------------------------------------------
@@ -651,30 +776,29 @@ class SquadCog(commands.Cog, name="Squad"):
         if target.bot:
             await ctx.send("Bots don't have profiles.")
             return
-        user = await asyncio.to_thread(economy.get_user, target.id)
+        user = economy.get_user(target.id)
         if user is None:
             await ctx.send(f"**{esc(target.display_name)}** hasn't debuted yet.")
             return
-
-        def _profile_data():
-            cards_ = sl.xi_cards(target.id)
-            cap_ = card_db.get_card(user["captain_key"]) if user["captain_key"] else None
-            try:
-                from match_records import get_form
-                form_ = get_form(target.id, 5)
-            except Exception:
-                form_ = []
-            return cards_, cap_, form_, len(economy.owned_keys(target.id))
-        cards, cap, form, n_players = await asyncio.to_thread(_profile_data)
+        cards = sl.xi_cards(target.id)
+        cap = card_db.get_card(user["captain_key"]) if user["captain_key"] else None
+        try:
+            from match_records import get_form
+            form = get_form(target.id, 5)
+        except Exception:
+            form = []
         wins = sum(1 for m in form if m["won"])
-        form_txt = " ".join("🟩" if m["won"] else "🟥" for m in form) or "No matches yet"
+        form_txt = " ".join(
+            "<:Wonprofile:1558139744008020088>" if m["won"] else "<:Lossprofile:1558139747275243643>"
+            for m in form
+        ) or "No matches yet"
         embed = discord.Embed(title=f"👤 {esc(user['team_name'])}", color=discord.Color.blurple())
         embed.set_author(name=esc(target.display_name), icon_url=target.display_avatar.url)
-        embed.add_field(name="💰 Purse", value=economy.fmt_coins(user["purse"]))
-        embed.add_field(name="📊 XI OVR", value=str(sl.average_ovr(cards)))
-        embed.add_field(name="©️ Captain", value=esc(cap["playername"]) if cap else "Not set")
-        embed.add_field(name="🃏 Players", value=str(n_players))
-        embed.add_field(name="🔥 Daily streak", value=str(user["daily_streak"]))
+        embed.add_field(name="Purse", value=economy.fmt_coins(user["purse"]))
+        embed.add_field(name="<:OVR:1558139691482751066> XI OVR", value=str(sl.average_ovr(cards)))
+        embed.add_field(name="<:Captain:1558139695177932951> Captain", value=esc(cap["playername"]) if cap else "Not set")
+        embed.add_field(name="<:Squad:1558139688231903322> Players", value=str(len(economy.owned_keys(target.id))))
+        embed.add_field(name="<:Streak:1558139736617390292> Daily streak", value=str(user["daily_streak"]))
         embed.add_field(name=f"Form (last {len(form)})", value=f"{form_txt}\n{wins} win(s)" if form else form_txt)
         await ctx.send(embed=embed)
 
@@ -688,13 +812,14 @@ class SquadCog(commands.Cog, name="Squad"):
             "`csdebut` create team\n`csstarterpack` first players\n`csdaily` `csweekly` (Premium) `csmonthly` free coins + player"
         ), inline=False)
         embed.add_field(name="Squad", value=(
-            "`cssquad` `csshow <player>` `csxi` `csautoxi` `csautoplay` (Premium) · `csxi @user` (Premium)\n"
+            "`cssquad` `csshow <player>` `csxi` `csovr` XI image + OVR · `csautoxi` `csautoplay` (Premium) · `csxi @user` (Premium)\n"
             "`csswap 3 5` or `csswap A | B`\n`cscaptain <player>` `csteamname <name>` `csprofile`\n"
-            "`csview <player>` your stats on a card you own · `csdata <player>` all-owners stats (Premium)"
+            "`csview <player>` your stats on a card you own · `csdata <player>` all-owners stats (Premium)\n"
+            "`cssubs` view Impact Player subs · `cssubs add/remove <player>` · `cssubs clear`"
         ), inline=False)
         embed.add_field(name="Economy", value=(
             "`cspurse` `cspack` `csopen <type>`\n`csbuy <player>` `cssell <player>`\n"
-            "`cstrade @user my player | their player` `csleaderboard`"
+            "`cstrade @user my player | their player` (same OVR, 5,000 coins fee each) `cspending` `csleaderboard`"
         ), inline=False)
         embed.add_field(name="Play", value="`csmp @user <overs>` challenge • `cscancel` cancel match", inline=False)
         await ctx.send(embed=embed)
@@ -707,41 +832,41 @@ class SquadCog(commands.Cog, name="Squad"):
         if member.id == ctx.author.id or member.bot:
             await ctx.send("❌ Can't ban that user.")
             return
-        await asyncio.to_thread(security.ban_user, member.id, security.clean_input(reason, 150))
+        security.ban_user(member.id, security.clean_input(reason, 150))
         await ctx.send(f"🚫 Banned **{esc(member.display_name)}**.")
 
     @commands.command(name="csunban")
     @security.owner_or_admin_role()
     async def csunban(self, ctx: commands.Context, member: discord.User):
         """(Owner) Let someone use the bot again."""
-        await asyncio.to_thread(security.unban_user, member.id)
+        security.unban_user(member.id)
         await ctx.send(f"✅ Unbanned **{esc(member.display_name)}**.")
 
     @commands.command(name="csgivecoins")
     @security.owner_or_admin_role()
     async def csgivecoins(self, ctx: commands.Context, member: discord.Member, amount: int):
         """(Owner) Give (or take with a negative number) coins."""
-        if not await asyncio.to_thread(economy.user_exists, member.id):
+        if not economy.user_exists(member.id):
             await ctx.send("❌ That user hasn't debuted.")
             return
         if not -1_000_000_000 <= amount <= 1_000_000_000:
             await ctx.send("❌ Amount too large.")
             return
-        bal = await asyncio.to_thread(economy.add_coins, member.id, amount, f"Owner adjustment by {ctx.author.id}")
+        bal = economy.add_coins(member.id, amount, f"Owner adjustment by {ctx.author.id}")
         await ctx.send(f"✅ {esc(member.display_name)} now has **{economy.fmt_coins(bal)}**.")
 
     @commands.command(name="csgivecard")
     @security.owner_or_admin_role()
     async def csgivecard(self, ctx: commands.Context, member: discord.Member, *, player: str):
         """(Owner) Give someone a player card."""
-        card, err = await asyncio.to_thread(sl.resolve_any, security.clean_input(player))
+        card, err = sl.resolve_any(security.clean_input(player))
         if card is None:
             await ctx.send(f"❌ {err}")
             return
-        if await asyncio.to_thread(economy.give_card, member.id, card["playername_key"]):
+        if economy.give_card(member.id, card["playername_key"]):
             await ctx.send(f"✅ Gave **{esc(card['playername'])}** to {esc(member.display_name)}.")
         else:
-            await ctx.send("❌ They haven't debuted, or already own that player.")
+            await ctx.send("❌ They haven't debuted, already own that player, or their squad is full (25).")
 
 
 async def setup(bot: commands.Bot):
