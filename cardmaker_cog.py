@@ -16,6 +16,7 @@
     /paneladder     add a new stats-panel overlay image (sits IN FRONT of the foreground)
     /panelremover   remove a stats-panel overlay from the panel list
     /panelfixer     move / resize a card's stats-panel overlay
+    /panelmerge     move a panel's artwork onto another pathname, then retire the first one (same as /bgmerge)
 
 Only OWNER_ID may run any of these — everyone else gets a plain refusal.
 """
@@ -44,6 +45,7 @@ from card_db import (
     remove_playstyle_logo, cards_using_playstyle_logo,
     panel_exists, get_panel, add_panel, list_panels, remove_panel,
     update_panel_layout, set_card_panel,
+    cards_using_panel, reassign_cards_panel,
     get_country_logo, add_country_logo, list_country_logos, update_country_logo_layout,
     GENERATED_DIR, BACKGROUNDS_DIR, LOGOS_DIR, PANELS_DIR, COUNTRY_LOGOS_DIR,
 )
@@ -86,7 +88,7 @@ TARGET_CHOICES = [
 
 async def logo_autocomplete(interaction: discord.Interaction, current: str):
     current_l = current.lower()
-    names = [n for n in await asyncio.to_thread(list_playstyle_logos) if current_l in n.lower()]
+    names = [n for n in list_playstyle_logos() if current_l in n.lower()]
     return [app_commands.Choice(name=n, value=n) for n in names[:25]]
 
 
@@ -99,13 +101,13 @@ async def narrative_name_autocomplete(interaction: discord.Interaction, current:
 
 async def background_autocomplete(interaction: discord.Interaction, current: str):
     current_l = current.lower()
-    names = [n for n in await asyncio.to_thread(list_backgrounds) if current_l in n.lower()]
+    names = [n for n in list_backgrounds() if current_l in n.lower()]
     return [app_commands.Choice(name=n, value=n) for n in names[:25]]
 
 
 async def panel_autocomplete(interaction: discord.Interaction, current: str):
     current_l = current.lower()
-    names = [n for n in await asyncio.to_thread(list_panels) if current_l in n.lower()]
+    names = [n for n in list_panels() if current_l in n.lower()]
     return [app_commands.Choice(name=n, value=n) for n in names[:25]]
 
 
@@ -117,22 +119,22 @@ async def country_autocomplete(interaction: discord.Interaction, current: str):
 
 async def playername_autocomplete(interaction: discord.Interaction, current: str):
     current_l = current.lower()
-    names = [n for n in await asyncio.to_thread(list_playernames) if current_l in n.lower()]
+    names = [n for n in list_playernames() if current_l in n.lower()]
     return [app_commands.Choice(name=n, value=n) for n in names[:25]]
 
 
 async def _regenerate_silently(playername: str) -> bool:
     """Redraw a card's image without posting anything. True on success."""
     try:
-        card = await asyncio.to_thread(get_card, playername)
-        bg = await asyncio.to_thread(get_background, card["background"]) if card else None
+        card = get_card(playername)
+        bg = get_background(card["background"]) if card else None
         if bg is None:
             return False
         buf = await generate_card_image(card, bg["local_path"])
         out_path = GENERATED_DIR / f"{playername.strip().lower().replace(' ', '_')}.png"
         with open(out_path, "wb") as f:
             f.write(buf.getvalue())
-        await asyncio.to_thread(set_card_image_path, playername, str(out_path))
+        set_card_image_path(playername, str(out_path))
         await card_cache.warm(str(out_path))
         return True
     except Exception:
@@ -140,8 +142,8 @@ async def _regenerate_silently(playername: str) -> bool:
 
 
 async def _regenerate_and_send(interaction: discord.Interaction, playername: str, verb: str) -> None:
-    card = await asyncio.to_thread(get_card, playername)
-    bg = await asyncio.to_thread(get_background, card["background"])
+    card = get_card(playername)
+    bg = get_background(card["background"])
     if bg is None:
         await interaction.followup.send(
             f"⚠️ Card saved, but background template `{card['background']}` "
@@ -152,7 +154,7 @@ async def _regenerate_and_send(interaction: discord.Interaction, playername: str
     out_path = GENERATED_DIR / f"{playername.strip().lower().replace(' ', '_')}.png"
     with open(out_path, "wb") as f:
         f.write(buf.getvalue())
-    await asyncio.to_thread(set_card_image_path, playername, str(out_path))
+    set_card_image_path(playername, str(out_path))
     await card_cache.warm(str(out_path))   # so csview/csbuy/cssell are instant
     buf.seek(0)
     file = discord.File(buf, filename=f"{card['displayname']}.png")
@@ -177,11 +179,9 @@ async def _regenerate_and_send(interaction: discord.Interaction, playername: str
     await interaction.followup.send(embed=embed, file=file)
 
 
-async def _missing_logo_note(names) -> str:
+def _missing_logo_note(names) -> str:
     """Note to append when a chosen narrative has no logo in the logo list yet."""
-    missing = await asyncio.to_thread(
-        lambda: [n for n in names if n and not playstyle_logo_exists(n)]
-    )
+    missing = [n for n in names if n and not playstyle_logo_exists(n)]
     if not missing:
         return ""
     return (
@@ -201,7 +201,7 @@ class CardMakerCog(commands.Cog):
         # permanent folder yet (e.g. cards made before this feature existed).
         async def _warm():
             try:
-                new, have, failed = await cache_all_foregrounds(await asyncio.to_thread(list_all_cards))
+                new, have, failed = await cache_all_foregrounds(list_all_cards())
                 print(f"[foregrounds] saved {new} new, {have} already saved, {len(failed)} failed")
                 if failed:
                     print("[foregrounds] dead links for: " + ", ".join(failed))
@@ -238,7 +238,7 @@ class CardMakerCog(commands.Cog):
         battinghand="Right hand or left hand batter",
         narrative1="Playstyle 1 (optional) — its logo shows on the card",
         narrative2="Playstyle 2 (optional) — its logo shows on the card",
-        bowlingtype="Bowling type for bowlers/all-rounders (default Fast)",
+        bowlingtype="Bowling type for bowlers/all-rounders (Fast / Medium Pacer / Off Spin / Leg Spin / Orthodox; default Fast)",
     )
     @app_commands.choices(
         role=ROLE_CHOICES, battinghand=HAND_CHOICES,
@@ -270,7 +270,7 @@ class CardMakerCog(commands.Cog):
             await interaction.followup.send("❌ narrative1 and narrative2 can't be the same — pick two different playstyles.")
             return
 
-        if await asyncio.to_thread(card_exists, playername):
+        if card_exists(playername):
             await interaction.followup.send(
                 f"❌ A card for **{playername}** already exists. "
                 f"Use `/editcard` to change it instead."
@@ -285,14 +285,14 @@ class CardMakerCog(commands.Cog):
             return
         country_name, country_emoji = country
 
-        bg = await asyncio.to_thread(get_background, background)
+        bg = get_background(background)
         if bg is None:
-            names = await asyncio.to_thread(list_backgrounds)
+            names = list_backgrounds()
             hint = ", ".join(names) if names else "(none added yet — use `/bgadder` first)"
             await interaction.followup.send(f"❌ Unknown background `{background}`.\nAvailable: {hint}")
             return
 
-        await asyncio.to_thread(create_card, 
+        create_card(
             playername=playername,
             displayname=displayname,
             foreground_link=foregroundlink,
@@ -307,7 +307,7 @@ class CardMakerCog(commands.Cog):
 
         try:
             await _regenerate_and_send(interaction, playername, "✅ Card created")
-            note = await _missing_logo_note([narrative1, narrative2])
+            note = _missing_logo_note([narrative1, narrative2])
             if note:
                 await interaction.followup.send(note.strip())
         except Exception as e:
@@ -333,7 +333,7 @@ class CardMakerCog(commands.Cog):
         battinghand="New batting hand",
         narrative1="New playstyle 1 (choose None to remove)",
         narrative2="New playstyle 2 (choose None to remove)",
-        bowlingtype="New bowling type (Fast / Off Spin / Leg Spin)",
+        bowlingtype="New bowling type (Fast / Medium Pacer / Off Spin / Leg Spin / Orthodox)",
         panel="Stats-panel overlay image (added via /paneladder) — type none to remove",
     )
     @app_commands.choices(
@@ -368,7 +368,7 @@ class CardMakerCog(commands.Cog):
     ):
         await interaction.response.defer()
 
-        if not await asyncio.to_thread(card_exists, playername):
+        if not card_exists(playername):
             await interaction.followup.send(
                 f"❌ No card exists for **{playername}** yet. Use `/cardmaker` to create it first."
             )
@@ -380,9 +380,9 @@ class CardMakerCog(commands.Cog):
         if foregroundlink is not None:
             updates["foreground_link"] = foregroundlink
         if background is not None:
-            bg = await asyncio.to_thread(get_background, background)
+            bg = get_background(background)
             if bg is None:
-                names = await asyncio.to_thread(list_backgrounds)
+                names = list_backgrounds()
                 hint = ", ".join(names) if names else "(none added yet)"
                 await interaction.followup.send(f"❌ Unknown background `{background}`.\nAvailable: {hint}")
                 return
@@ -424,9 +424,9 @@ class CardMakerCog(commands.Cog):
                 panel_update_pending = True
                 new_panel_value = None
             else:
-                prow = await asyncio.to_thread(get_panel, panel)
+                prow = get_panel(panel)
                 if prow is None:
-                    names = await asyncio.to_thread(list_panels)
+                    names = list_panels()
                     hint = ", ".join(names) if names else "(none added yet — use `/paneladder` first)"
                     await interaction.followup.send(f"❌ Unknown panel `{panel}`.\nAvailable: {hint}")
                     return
@@ -438,7 +438,7 @@ class CardMakerCog(commands.Cog):
             return
 
         if slot_updates:
-            current = await asyncio.to_thread(get_card, playername)
+            current = get_card(playername)
             final1 = slot_updates.get("playstyle1", current["playstyle1"])
             final2 = slot_updates.get("playstyle2", current["playstyle2"])
             if final1 and final2 and final1.lower() == final2.lower():
@@ -446,15 +446,15 @@ class CardMakerCog(commands.Cog):
                 return
 
         if updates:
-            await asyncio.to_thread(update_card, playername, **updates)
+            update_card(playername, **updates)
         if slot_updates:
-            await asyncio.to_thread(set_playstyles, playername, **slot_updates)
+            set_playstyles(playername, **slot_updates)
         if panel_update_pending:
-            await asyncio.to_thread(set_card_panel, playername, new_panel_value)
+            set_card_panel(playername, new_panel_value)
 
         try:
             await _regenerate_and_send(interaction, playername, "✏️ Card updated")
-            note = await _missing_logo_note(list(slot_updates.values()))
+            note = _missing_logo_note(list(slot_updates.values()))
             if note:
                 await interaction.followup.send(note.strip())
         except Exception as e:
@@ -468,7 +468,7 @@ class CardMakerCog(commands.Cog):
     async def csrarity(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        cards = await asyncio.to_thread(list_all_cards)
+        cards = list_all_cards()
         if not cards:
             await interaction.followup.send("No cards have been added yet.", ephemeral=True)
             return
@@ -513,10 +513,10 @@ class CardMakerCog(commands.Cog):
             await interaction.followup.send("❌ `keep` and `replace_with` can't be the same pathname.")
             return
 
-        keep_bg = await asyncio.to_thread(get_background, keep)
-        new_bg = await asyncio.to_thread(get_background, replace_with)
+        keep_bg = get_background(keep)
+        new_bg = get_background(replace_with)
         if keep_bg is None or new_bg is None:
-            names = await asyncio.to_thread(list_backgrounds)
+            names = list_backgrounds()
             hint = ", ".join(names) if names else "(none added yet)"
             missing = keep if keep_bg is None else replace_with
             await interaction.followup.send(f"❌ Unknown background `{missing}`.\nAvailable: {hint}")
@@ -524,7 +524,7 @@ class CardMakerCog(commands.Cog):
 
         # Cards already on `keep` (will be redrawn with the new art) and cards
         # on `replace_with` (will be switched over to `keep`'s name).
-        already_on_keep = await asyncio.to_thread(cards_using_background, keep_bg["pathname"])
+        already_on_keep = cards_using_background(keep_bg["pathname"])
 
         # 1) Physically overwrite keep's template file with replace_with's artwork,
         #    so the `keep` pathname now points at the new design permanently.
@@ -535,10 +535,10 @@ class CardMakerCog(commands.Cog):
             return
 
         # 2) Point every card that was on replace_with at keep instead.
-        moved_count = await asyncio.to_thread(reassign_cards_background, new_bg["pathname"], keep_bg["pathname"])
+        moved_count = reassign_cards_background(new_bg["pathname"], keep_bg["pathname"])
 
         # 3) Retire replace_with — its art now lives under `keep`.
-        await asyncio.to_thread(delete_background, new_bg["pathname"])
+        delete_background(new_bg["pathname"])
         try:
             os.remove(new_bg["local_path"])
         except OSError:
@@ -547,7 +547,7 @@ class CardMakerCog(commands.Cog):
         # 4) Redraw every card now sitting on `keep` so their generated PNG
         #    picks up the new artwork. Cards with a dead foreground link will
         #    fail silently here — that's a separate, pre-existing problem.
-        affected = sorted(set(already_on_keep) | set(await asyncio.to_thread(cards_using_background, keep_bg["pathname"])))
+        affected = sorted(set(already_on_keep) | set(cards_using_background(keep_bg["pathname"])))
         refreshed, skipped = [], []
         for name in affected:
             if await _regenerate_silently(name):
@@ -582,7 +582,7 @@ class CardMakerCog(commands.Cog):
     async def bgadder(self, interaction: discord.Interaction, link: str, pathname: str):
         await interaction.response.defer()
 
-        if await asyncio.to_thread(background_exists, pathname):
+        if background_exists(pathname):
             await interaction.followup.send(f"❌ A background named `{pathname}` already exists — pick a different name.")
             return
 
@@ -599,8 +599,85 @@ class CardMakerCog(commands.Cog):
         with open(local_path, "wb") as f:
             f.write(data)
 
-        await asyncio.to_thread(add_background, pathname, link, str(local_path), interaction.user.id)
+        add_background(pathname, link, str(local_path), interaction.user.id)
         await interaction.followup.send(f"✅ Background **{pathname}** added. Pick it in `/cardmaker`'s `background` option.")
+
+    # ── /panelmerge ──────────────────────────────────────────────────
+    @app_commands.command(
+        name="panelmerge",
+        description="Move a panel's artwork onto another pathname, then retire the first one",
+    )
+    @app_commands.describe(
+        keep="Pathname that survives (e.g. csbase) — every card ends up using this name",
+        replace_with="Pathname whose artwork takes over `keep`'s slot, then gets deleted (e.g. tester)",
+    )
+    @app_commands.autocomplete(keep=panel_autocomplete, replace_with=panel_autocomplete)
+    @is_owner()
+    async def panelmerge(self, interaction: discord.Interaction, keep: str, replace_with: str):
+        await interaction.response.defer()
+
+        if keep.strip().lower() == replace_with.strip().lower():
+            await interaction.followup.send("❌ `keep` and `replace_with` can't be the same pathname.")
+            return
+
+        keep_panel = get_panel(keep)
+        new_panel = get_panel(replace_with)
+        if keep_panel is None or new_panel is None:
+            names = list_panels()
+            hint = ", ".join(names) if names else "(none added yet)"
+            missing = keep if keep_panel is None else replace_with
+            await interaction.followup.send(f"❌ Unknown panel `{missing}`.\nAvailable: {hint}")
+            return
+
+        # Cards already on `keep` (will be redrawn with the new art) and cards
+        # on `replace_with` (will be switched over to `keep`'s name).
+        already_on_keep = cards_using_panel(keep_panel["pathname"])
+
+        # 1) Physically overwrite keep's panel file with replace_with's artwork,
+        #    so the `keep` pathname now points at the new design permanently.
+        try:
+            shutil.copyfile(new_panel["local_path"], keep_panel["local_path"])
+        except OSError as e:
+            await interaction.followup.send(f"❌ Could not copy artwork onto `{keep_panel['pathname']}`: `{e}`")
+            return
+
+        # 2) Point every card that was on replace_with at keep instead.
+        moved_count = reassign_cards_panel(new_panel["pathname"], keep_panel["pathname"])
+
+        # 3) Retire replace_with — its art now lives under `keep`.
+        remove_panel(new_panel["pathname"])
+        try:
+            os.remove(new_panel["local_path"])
+        except OSError:
+            pass
+
+        # 4) Redraw every card now sitting on `keep` so their generated PNG
+        #    picks up the new artwork. Cards with a dead foreground link will
+        #    fail silently here — that's a separate, pre-existing problem.
+        affected = sorted(set(already_on_keep) | set(cards_using_panel(keep_panel["pathname"])))
+        refreshed, skipped = [], []
+        for name in affected:
+            if await _regenerate_silently(name):
+                refreshed.append(name)
+            else:
+                skipped.append(name)
+
+        summary = [
+            f"🔀 `{new_panel['pathname']}` merged into `{keep_panel['pathname']}` and removed.",
+            f"📇 {moved_count} card(s) switched from `{new_panel['pathname']}` to `{keep_panel['pathname']}`.",
+            f"🔄 Redrew {len(refreshed)}/{len(affected)} card(s) using `{keep_panel['pathname']}`.",
+        ]
+        if skipped:
+            summary.append(
+                f"⚠️ Skipped {len(skipped)} (likely a dead `foregroundlink` — fix with `/editcard` then "
+                f"it'll pick up the new panel automatically): " + ", ".join(skipped)[:800]
+            )
+
+        text = "\n".join(summary)
+        if len(text) > 1900:
+            text = text[:1900] + "…"
+        file = discord.File(io.BytesIO("\n".join(affected).encode() or b"(none)"), filename="affected_cards.txt")
+        await interaction.followup.send(content=text, file=file)
 
     # ── /paneladder ──────────────────────────────────────────────────
     @app_commands.command(
@@ -615,7 +692,7 @@ class CardMakerCog(commands.Cog):
     async def paneladder(self, interaction: discord.Interaction, url: str, pathname: str):
         await interaction.response.defer()
 
-        if await asyncio.to_thread(panel_exists, pathname):
+        if panel_exists(pathname):
             await interaction.followup.send(f"❌ A panel named `{pathname}` already exists — pick a different name.")
             return
 
@@ -634,7 +711,7 @@ class CardMakerCog(commands.Cog):
         with open(local_path, "wb") as f:
             f.write(data)
 
-        await asyncio.to_thread(add_panel, pathname, url, str(local_path), interaction.user.id)
+        add_panel(pathname, url, str(local_path), interaction.user.id)
         await interaction.followup.send(
             f"✅ Panel **{pathname}** added. Put it on a card with "
             f"`/editcard playername:<card> panel:{pathname}`, then nudge it with `/panelfixer`.\n"
@@ -650,9 +727,9 @@ class CardMakerCog(commands.Cog):
     async def panelremover(self, interaction: discord.Interaction, pathname: str):
         await interaction.response.defer()
 
-        removed = await asyncio.to_thread(remove_panel, pathname)
+        removed = remove_panel(pathname)
         if removed is None:
-            names = await asyncio.to_thread(list_panels)
+            names = list_panels()
             hint = ", ".join(names) if names else "(none added yet)"
             await interaction.followup.send(f"❌ No panel found named `{pathname}`.\nAvailable: {hint}")
             return
@@ -677,7 +754,7 @@ class CardMakerCog(commands.Cog):
     @is_owner()
     async def foregroundsaveall(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        new, have, failed = await cache_all_foregrounds(await asyncio.to_thread(list_all_cards))
+        new, have, failed = await cache_all_foregrounds(list_all_cards())
         msg = f"✅ Saved **{new}** new foreground(s). **{have}** were already saved."
         if failed:
             msg += (f"\n⚠️ {len(failed)} have a dead link and could not be saved — fix them with "
@@ -710,9 +787,9 @@ class CardMakerCog(commands.Cog):
     ):
         await interaction.response.defer()
 
-        card = await asyncio.to_thread(get_card, playername)
+        card = get_card(playername)
         if card is None:
-            names = await asyncio.to_thread(list_playernames)
+            names = list_playernames()
             hint = ", ".join(names) if names else "(no cards yet)"
             await interaction.followup.send(f"❌ No card found for **{playername}**.\nExisting cards: {hint}")
             return
@@ -722,7 +799,7 @@ class CardMakerCog(commands.Cog):
         new_scale_pct = card["scale_pct"] + foregroundsizebig - foregroundsizesmall
         new_scale_pct = max(MIN_SCALE_PCT, min(MAX_SCALE_PCT, new_scale_pct))
 
-        await asyncio.to_thread(update_card_offset, playername, new_offset_x, new_offset_y, new_scale_pct)
+        update_card_offset(playername, new_offset_x, new_offset_y, new_scale_pct)
 
         try:
             await _regenerate_and_send(
@@ -743,7 +820,7 @@ class CardMakerCog(commands.Cog):
     async def logoadderofplaystyle(self, interaction: discord.Interaction, url: str, pathname: str):
         await interaction.response.defer()
 
-        if await asyncio.to_thread(playstyle_logo_exists, pathname):
+        if playstyle_logo_exists(pathname):
             await interaction.followup.send(f"❌ A logo named `{pathname}` already exists — pick a different name.")
             return
 
@@ -761,7 +838,7 @@ class CardMakerCog(commands.Cog):
         local_path = LOGOS_DIR / f"{pathname.strip().lower().replace(' ', '_')}.png"
         logo.save(local_path, format="PNG")
 
-        await asyncio.to_thread(add_playstyle_logo, pathname, url, str(local_path), interaction.user.id)
+        add_playstyle_logo(pathname, url, str(local_path), interaction.user.id)
         await interaction.followup.send(
             f"✅ Playstyle logo **{pathname}** added. Pick it with `/setplaystylelogo`."
         )
@@ -778,11 +855,11 @@ class CardMakerCog(commands.Cog):
         await interaction.response.defer()
 
         # Cards that carry this logo right now (read BEFORE removing, for the refresh below).
-        affected = await asyncio.to_thread(cards_using_playstyle_logo, pathname)
+        affected = cards_using_playstyle_logo(pathname)
 
-        removed = await asyncio.to_thread(remove_playstyle_logo, pathname)
+        removed = remove_playstyle_logo(pathname)
         if removed is None:
-            names = await asyncio.to_thread(list_playstyle_logos)
+            names = list_playstyle_logos()
             hint = ", ".join(names) if names else "(none added yet)"
             await interaction.followup.send(f"❌ No playstyle logo found named `{pathname}`.\nAvailable: {hint}")
             return
@@ -833,8 +910,8 @@ class CardMakerCog(commands.Cog):
     ):
         await interaction.response.defer()
 
-        if not await asyncio.to_thread(card_exists, playername):
-            names = await asyncio.to_thread(list_playernames)
+        if not card_exists(playername):
+            names = list_playernames()
             hint = ", ".join(names) if names else "(no cards yet)"
             await interaction.followup.send(f"❌ No card found for **{playername}**.\nExisting cards: {hint}")
             return
@@ -844,9 +921,9 @@ class CardMakerCog(commands.Cog):
             if name is None:
                 chosen.append(None)
                 continue
-            row = await asyncio.to_thread(get_playstyle_logo, name)
+            row = get_playstyle_logo(name)
             if row is None:
-                names = await asyncio.to_thread(list_playstyle_logos)
+                names = list_playstyle_logos()
                 hint = ", ".join(names) if names else "(none added yet — use `/logoadderofplaystyle` first)"
                 await interaction.followup.send(f"❌ Unknown logo `{name}`.\nAvailable: {hint}")
                 return
@@ -857,7 +934,7 @@ class CardMakerCog(commands.Cog):
             return
 
         # Replaces both slots: leaving logo2 empty removes any second logo.
-        await asyncio.to_thread(set_playstyles, playername, chosen[0], chosen[1])
+        set_playstyles(playername, chosen[0], chosen[1])
 
         try:
             await _regenerate_and_send(interaction, playername, "🎯 Playstyle logo(s) set")
@@ -893,9 +970,9 @@ class CardMakerCog(commands.Cog):
     ):
         await interaction.response.defer()
 
-        card = await asyncio.to_thread(get_card, playername)
+        card = get_card(playername)
         if card is None:
-            names = await asyncio.to_thread(list_playernames)
+            names = list_playernames()
             hint = ", ".join(names) if names else "(no cards yet)"
             await interaction.followup.send(f"❌ No card found for **{playername}**.\nExisting cards: {hint}")
             return
@@ -914,7 +991,7 @@ class CardMakerCog(commands.Cog):
             new_dy = card[f"logo{s}_dy"] - logoup + logodown
             new_scale = card[f"logo{s}_scale"] + logosizebig - logosizesmall
             new_scale = max(MIN_SCALE_PCT, min(MAX_SCALE_PCT, new_scale))
-            await asyncio.to_thread(update_logo_layout, playername, s, new_dx, new_dy, new_scale)
+            update_logo_layout(playername, s, new_dx, new_dy, new_scale)
             summary.append(f"logo {s}: x={new_dx}, y={new_dy}, size={new_scale}%")
 
         try:
@@ -960,7 +1037,7 @@ class CardMakerCog(commands.Cog):
         # country_name comes from the fixed country list, so this file name is always safe.
         local_path = COUNTRY_LOGOS_DIR / f"{country_name.strip().lower().replace(' ', '_')}.png"
         logo.save(local_path, format="PNG")
-        replaced = await asyncio.to_thread(add_country_logo, country_name, url, str(local_path), interaction.user.id)
+        replaced = add_country_logo(country_name, url, str(local_path), interaction.user.id)
 
         verb = "replaced" if replaced else "added"
         await interaction.followup.send(
@@ -995,15 +1072,15 @@ class CardMakerCog(commands.Cog):
     ):
         await interaction.response.defer()
 
-        card = await asyncio.to_thread(get_card, playername)
+        card = get_card(playername)
         if card is None:
-            names = await asyncio.to_thread(list_playernames)
+            names = list_playernames()
             hint = ", ".join(names) if names else "(no cards yet)"
             await interaction.followup.send(f"❌ No card found for **{playername}**.\nExisting cards: {hint}")
             return
 
-        if await asyncio.to_thread(get_country_logo, card["country"]) is None:
-            have = await asyncio.to_thread(list_country_logos)
+        if get_country_logo(card["country"]) is None:
+            have = list_country_logos()
             hint = ", ".join(have) if have else "(none added yet)"
             await interaction.followup.send(
                 f"❌ There is no logo for **{card['country']}** yet — add one with "
@@ -1016,7 +1093,7 @@ class CardMakerCog(commands.Cog):
         new_scale = card["countrylogo_scale"] + logosizebig - logosizesmall
         new_scale = max(MIN_SCALE_PCT, min(MAX_SCALE_PCT, new_scale))
 
-        await asyncio.to_thread(update_country_logo_layout, playername, new_dx, new_dy, new_scale)
+        update_country_logo_layout(playername, new_dx, new_dy, new_scale)
 
         try:
             await _regenerate_and_send(
@@ -1055,9 +1132,9 @@ class CardMakerCog(commands.Cog):
     ):
         await interaction.response.defer()
 
-        card = await asyncio.to_thread(get_card, playername)
+        card = get_card(playername)
         if card is None:
-            names = await asyncio.to_thread(list_playernames)
+            names = list_playernames()
             hint = ", ".join(names) if names else "(no cards yet)"
             await interaction.followup.send(f"❌ No card found for **{playername}**.\nExisting cards: {hint}")
             return
@@ -1073,7 +1150,7 @@ class CardMakerCog(commands.Cog):
         new_dy = card["hand_dy"] - playtypeup + playtypedown
         new_size = max(8, min(80, card["hand_size"] + playtypesizebig - playtypesizesmall))
 
-        await asyncio.to_thread(update_card_layout, playername, hand_dx=new_dx, hand_dy=new_dy, hand_size=new_size)
+        update_card_layout(playername, hand_dx=new_dx, hand_dy=new_dy, hand_size=new_size)
 
         try:
             await _regenerate_and_send(
@@ -1109,9 +1186,9 @@ class CardMakerCog(commands.Cog):
     ):
         await interaction.response.defer()
 
-        card = await asyncio.to_thread(get_card, playername)
+        card = get_card(playername)
         if card is None:
-            names = await asyncio.to_thread(list_playernames)
+            names = list_playernames()
             hint = ", ".join(names) if names else "(no cards yet)"
             await interaction.followup.send(f"❌ No card found for **{playername}**.\nExisting cards: {hint}")
             return
@@ -1128,7 +1205,7 @@ class CardMakerCog(commands.Cog):
         new_scale = card["panelimg_scale"] + panelsizebig - panelsizesmall
         new_scale = max(MIN_SCALE_PCT, min(MAX_SCALE_PCT, new_scale))
 
-        await asyncio.to_thread(update_panel_layout, playername, new_dx, new_dy, new_scale)
+        update_panel_layout(playername, new_dx, new_dy, new_scale)
 
         try:
             await _regenerate_and_send(
@@ -1199,9 +1276,9 @@ class CardMakerCog(commands.Cog):
     ):
         await interaction.response.defer()
 
-        card = await asyncio.to_thread(get_card, playername)
+        card = get_card(playername)
         if card is None:
-            names = await asyncio.to_thread(list_playernames)
+            names = list_playernames()
             hint = ", ".join(names) if names else "(no cards yet)"
             await interaction.followup.send(f"❌ No card found for **{playername}**.\nExisting cards: {hint}")
             return
@@ -1223,7 +1300,7 @@ class CardMakerCog(commands.Cog):
         new_role_dy = card["role_dy"] - roleup + roledown
         new_hand_dy = card["hand_dy"] - handup + handdown
 
-        await asyncio.to_thread(update_card_layout, 
+        update_card_layout(
             playername,
             name_dx=new_name_dx, name_dy=new_name_dy, name_size=new_name_size,
             ovr_dx=new_ovr_dx, ovr_dy=new_ovr_dy, ovr_size=new_ovr_size,
@@ -1260,15 +1337,15 @@ class CardMakerCog(commands.Cog):
                 "⏳ A refresh is already running. Wait for it to finish.", ephemeral=True
             )
             return
-        if panel is not None and not await asyncio.to_thread(panel_exists, panel):
-            names = await asyncio.to_thread(list_panels)
+        if panel is not None and not panel_exists(panel):
+            names = list_panels()
             hint = ", ".join(names) if names else "(no panels yet)"
             await interaction.response.send_message(
                 f"❌ No panel named **{panel}**.\nExisting panels: {hint}", ephemeral=True
             )
             return
 
-        names = await asyncio.to_thread(list_playernames)
+        names = list_playernames()
         if not names:
             await interaction.response.send_message("❌ There are no cards to refresh.", ephemeral=True)
             return
@@ -1286,7 +1363,7 @@ class CardMakerCog(commands.Cog):
                 for name in names:
                     try:
                         if panel is not None:
-                            await asyncio.to_thread(set_card_panel, name, panel)
+                            set_card_panel(name, panel)
                         ok = await _regenerate_silently(name)
                     except Exception:
                         ok = False
@@ -1326,9 +1403,9 @@ class CardMakerCog(commands.Cog):
     async def removecard(self, interaction: discord.Interaction, cardname: str):
         await interaction.response.defer()
 
-        deleted = await asyncio.to_thread(delete_card, cardname)
+        deleted = delete_card(cardname)
         if deleted is None:
-            names = await asyncio.to_thread(list_playernames)
+            names = list_playernames()
             hint = ", ".join(names) if names else "(no cards yet)"
             await interaction.followup.send(f"❌ No card found for **{cardname}**.\nExisting cards: {hint}")
             return

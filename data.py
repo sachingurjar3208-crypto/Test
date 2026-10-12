@@ -217,12 +217,14 @@ TIMELINE_EMOJIS = {
 }
 
 NOT_OUT_EMOJI = "<:28399:1557661632371359764>"
-LBW_EMOJI     = "<:cs_lbw:1519933921385775156>"
+LBW_EMOJI     = "<a:LBW:1558777617434419240>"
 
 BOWLING_TYPE_ICON = {
-    "Fast":     "",
-    "Off Spin": "",
-    "Leg Spin": "",
+    "Fast":         "",
+    "Medium Pacer": "",
+    "Off Spin":     "",
+    "Leg Spin":     "",
+    "Orthodox":     "",
 }
 
 # Button label → internal delivery name
@@ -248,6 +250,9 @@ DELIVERY_BUTTON_MAP = {
     "Flipper":  "Flipper",
     "Drifter":  "Drift Ball",
     "Slider":   "Slider",
+    # Orthodox / Medium Pacer
+    "Top Spinner": "Top Spinner",
+    "Good Length": "Good Length",
 }
 
 SHOT_BUTTON_MAP = {
@@ -310,6 +315,8 @@ BALL_DESCRIPTIONS = {
     "Flipper":    "flipper",
     "Drifter":    "drifting delivery",
     "Slider":     "slider",
+    "Cutter":     "cutter",
+    "Slower":     "slower ball",
     "Swing":       "swinging delivery",
     "Good Length": "good length delivery",
     "Off Break":   "off-break",
@@ -334,14 +341,46 @@ SHOT_DESCRIPTIONS = {
 FAST_STAGE1 = ["Outswing", "Inswing", "Fast", "Slow"]
 FAST_STAGE2 = ["Bouncer", "Full", "Good", "Yorker"]
 
-OFF_SPIN_BUTTONS = ["Offspin", "Carrom", "Arm Ball", "Doosra", "Topspin"]
-LEG_SPIN_BUTTONS = ["Legspin", "Googly", "Flipper", "Drifter", "Slider"]
+# Medium pacer — same two-stage flow as the fast bowler (row 1 first, then row 2)
+MEDIUM_STAGE1 = ["Outswing", "Inswing", "Cutter", "Slower"]
+MEDIUM_STAGE2 = ["Bouncer", "Yorker", "Good Length", "Full"]
+MEDIUM_PACER_SPEED = (110, 135)    # km/h — every medium-pacer delivery is random in this range
+
+OFF_SPIN_BUTTONS  = ["Offspin", "Carrom", "Arm Ball", "Doosra", "Topspin"]
+LEG_SPIN_BUTTONS  = ["Legspin", "Googly", "Flipper", "Drifter", "Slider"]
+ORTHODOX_BUTTONS  = ["Arm Ball", "Top Spinner", "Doosra", "Carrom", "Slider"]
 
 BOWLING_BUTTONS = {
-    "Fast":     FAST_STAGE2,   # used for spin, fast uses two-stage
+    "Fast":         FAST_STAGE2,   # used for spin, fast uses two-stage
+    "Medium Pacer": MEDIUM_STAGE2,
+    "Off Spin":     OFF_SPIN_BUTTONS,
+    "Leg Spin":     LEG_SPIN_BUTTONS,
+    "Orthodox":     ORTHODOX_BUTTONS,
+}
+
+# Two-stage (pace) bowlers: bowling_type -> (stage-1 buttons, stage-2 buttons)
+TWO_STAGE_BUTTONS = {
+    "Fast":         (FAST_STAGE1, FAST_STAGE2),
+    "Medium Pacer": (MEDIUM_STAGE1, MEDIUM_STAGE2),
+}
+# Single-step (spin) bowlers: bowling_type -> buttons
+SPIN_BUTTONS_BY_TYPE = {
     "Off Spin": OFF_SPIN_BUTTONS,
     "Leg Spin": LEG_SPIN_BUTTONS,
+    "Orthodox": ORTHODOX_BUTTONS,
 }
+
+
+def is_two_stage(bowling_type) -> bool:
+    return bowling_type in TWO_STAGE_BUTTONS
+
+
+def get_two_stage_buttons(bowling_type) -> tuple[list, list]:
+    return TWO_STAGE_BUTTONS.get(bowling_type, TWO_STAGE_BUTTONS["Fast"])
+
+
+def get_spin_buttons(bowling_type) -> list:
+    return SPIN_BUTTONS_BY_TYPE.get(bowling_type, LEG_SPIN_BUTTONS)
 
 BATTING_BUTTONS = ["Drive", "Loft", "Flick", "Pull", "Cut", "Sweep", "Scoop", "Defend", "Leave"]
 
@@ -383,6 +422,8 @@ SPIN_SHOT_GUIDE: dict[str, list[str]] = {
     "Flipper":  ["Drive", "Flick"],
     "Drifter":  ["Loft", "Flick"],
     "Slider":   ["Cut", "Flick"],
+    # Orthodox
+    "Top Spinner": ["Cut", "Pull"],
     # Off Spin
     "Offspin":  ["Drive", "Sweep"],
     "Carrom":   ["Cut"],
@@ -395,14 +436,35 @@ SPIN_SHOT_GUIDE: dict[str, list[str]] = {
     "Knuckle":    ["Pull", "Loft"],
 }
 
+# Medium pacer: (stage1_choice, stage2_button) → recommended shots.
+# Outswing / Inswing behave like the fast bowler's; Cutter and Slower are the slower variations.
+MEDIUM_SHOT_GUIDE: dict[tuple[str, str], list[str]] = {
+    ("Cutter", "Yorker"):       ["Flick", "Defend"],
+    ("Cutter", "Full"):         ["Sweep", "Flick"],
+    ("Cutter", "Good Length"):  ["Cut", "Pull"],
+    ("Cutter", "Bouncer"):      ["Loft", "Pull"],
+    ("Slower", "Yorker"):       ["Flick", "Defend"],
+    ("Slower", "Full"):         ["Drive", "Loft"],
+    ("Slower", "Good Length"):  ["Cut", "Pull", "Flick"],
+    ("Slower", "Bouncer"):      ["Pull", "Loft"],
+}
+for (_s1, _s2), _shots in list(FAST_SHOT_GUIDE.items()):
+    if _s1 in ("Outswing", "Inswing"):
+        MEDIUM_SHOT_GUIDE[(_s1, "Good Length" if _s2 == "Good" else _s2)] = list(_shots)
+FAST_SHOT_GUIDE.update(MEDIUM_SHOT_GUIDE)   # views look everything up in FAST_SHOT_GUIDE
+
 FAST_MYSTERY_POOL     = ["Fast", "Swing", "Yorker", "Bouncer", "Good Length", "Full"]
 OFF_SPIN_MYSTERY_POOL = ["Off Break", "Doosra", "Carrom Ball", "Arm Ball", "Top Spin"]
 LEG_SPIN_MYSTERY_POOL = ["Drift Ball", "Leg Break", "Googly", "Flipper", "Top Spinner", "Slider"]
 
+ORTHODOX_MYSTERY_POOL = ["Arm Ball", "Top Spinner", "Doosra", "Carrom Ball", "Slider"]
+
 MYSTERY_POOL = {
-    "Fast":     FAST_MYSTERY_POOL,
-    "Off Spin": OFF_SPIN_MYSTERY_POOL,
-    "Leg Spin": LEG_SPIN_MYSTERY_POOL,
+    "Fast":         FAST_MYSTERY_POOL,
+    "Medium Pacer": FAST_MYSTERY_POOL,
+    "Off Spin":     OFF_SPIN_MYSTERY_POOL,
+    "Leg Spin":     LEG_SPIN_MYSTERY_POOL,
+    "Orthodox":     ORTHODOX_MYSTERY_POOL,
 }
 
 COUNTRY_FLAGS = {
@@ -426,17 +488,17 @@ SAMPLE_TEAMS = {
         "ovr": 90,
         "chem": 94,
         "players": [
-            {"name": "Rohit Sharma",     "country": "India", "ovr": 92, "bat": 95, "bowl": 45, "bowling_type": "Fast",     "role": "Batter",      "card": "🥇"},
-            {"name": "Virat Kohli",      "country": "India", "ovr": 94, "bat": 97, "bowl": 40, "bowling_type": None,       "role": "Batter",      "card": "🥇"},
-            {"name": "Shubman Gill",     "country": "India", "ovr": 88, "bat": 90, "bowl": 28, "bowling_type": None,       "role": "Batter",      "card": "🥈"},
-            {"name": "Suryakumar Yadav", "country": "India", "ovr": 91, "bat": 93, "bowl": 22, "bowling_type": None,       "role": "Batter",      "card": "🥇"},
-            {"name": "Rishabh Pant",     "country": "India", "ovr": 88, "bat": 90, "bowl": 15, "bowling_type": None,       "role": "WK",          "card": "🥇"},
-            {"name": "Hardik Pandya",    "country": "India", "ovr": 87, "bat": 82, "bowl": 84, "bowling_type": "Fast",     "role": "All-Rounder", "card": "🥇"},
-            {"name": "Ravindra Jadeja",  "country": "India", "ovr": 89, "bat": 78, "bowl": 88, "bowling_type": "Off Spin", "role": "All-Rounder", "card": "🥇"},
-            {"name": "Kuldeep Yadav",    "country": "India", "ovr": 83, "bat": 38, "bowl": 87, "bowling_type": "Leg Spin", "role": "Bowler",      "card": "🥈"},
-            {"name": "Jasprit Bumrah",   "country": "India", "ovr": 92, "bat": 28, "bowl": 96, "bowling_type": "Fast",     "role": "Bowler",      "card": "🥇"},
-            {"name": "Mohammed Siraj",   "country": "India", "ovr": 84, "bat": 25, "bowl": 85, "bowling_type": "Fast",     "role": "Bowler",      "card": "🥈"},
-            {"name": "Yuzvendra Chahal", "country": "India", "ovr": 82, "bat": 22, "bowl": 84, "bowling_type": "Leg Spin", "role": "Bowler",      "card": "🥈"},
+            {"name": "Rohit Sharma",     "country": "India", "ovr": 92, "bat": 95, "bowl": 45, "bowling_type": "Fast",     "role": "Batter",      "card": ""},
+            {"name": "Virat Kohli",      "country": "India", "ovr": 94, "bat": 97, "bowl": 40, "bowling_type": None,       "role": "Batter",      "card": ""},
+            {"name": "Shubman Gill",     "country": "India", "ovr": 88, "bat": 90, "bowl": 28, "bowling_type": None,       "role": "Batter",      "card": ""},
+            {"name": "Suryakumar Yadav", "country": "India", "ovr": 91, "bat": 93, "bowl": 22, "bowling_type": None,       "role": "Batter",      "card": ""},
+            {"name": "Rishabh Pant",     "country": "India", "ovr": 88, "bat": 90, "bowl": 15, "bowling_type": None,       "role": "WK",          "card": ""},
+            {"name": "Hardik Pandya",    "country": "India", "ovr": 87, "bat": 82, "bowl": 84, "bowling_type": "Fast",     "role": "All-Rounder", "card": ""},
+            {"name": "Ravindra Jadeja",  "country": "India", "ovr": 89, "bat": 78, "bowl": 88, "bowling_type": "Off Spin", "role": "All-Rounder", "card": ""},
+            {"name": "Kuldeep Yadav",    "country": "India", "ovr": 83, "bat": 38, "bowl": 87, "bowling_type": "Leg Spin", "role": "Bowler",      "card": ""},
+            {"name": "Jasprit Bumrah",   "country": "India", "ovr": 92, "bat": 28, "bowl": 96, "bowling_type": "Fast",     "role": "Bowler",      "card": ""},
+            {"name": "Mohammed Siraj",   "country": "India", "ovr": 84, "bat": 25, "bowl": 85, "bowling_type": "Fast",     "role": "Bowler",      "card": ""},
+            {"name": "Yuzvendra Chahal", "country": "India", "ovr": 82, "bat": 22, "bowl": 84, "bowling_type": "Leg Spin", "role": "Bowler",      "card": ""},
         ],
     },
     "Australia": {
@@ -444,17 +506,17 @@ SAMPLE_TEAMS = {
         "ovr": 89,
         "chem": 91,
         "players": [
-            {"name": "David Warner",   "country": "Australia", "ovr": 91, "bat": 93, "bowl": 42, "bowling_type": None,       "role": "Batter",      "card": "🥇"},
-            {"name": "Travis Head",    "country": "Australia", "ovr": 89, "bat": 91, "bowl": 50, "bowling_type": "Off Spin", "role": "Batter",      "card": "🥇"},
-            {"name": "Steve Smith",    "country": "Australia", "ovr": 92, "bat": 94, "bowl": 55, "bowling_type": "Leg Spin", "role": "Batter",      "card": "🥇"},
-            {"name": "Glenn Maxwell",  "country": "Australia", "ovr": 88, "bat": 86, "bowl": 80, "bowling_type": "Off Spin", "role": "All-Rounder", "card": "🥇"},
-            {"name": "Matthew Wade",   "country": "Australia", "ovr": 82, "bat": 80, "bowl": 15, "bowling_type": None,       "role": "WK",          "card": "🥈"},
-            {"name": "Cameron Green",  "country": "Australia", "ovr": 84, "bat": 80, "bowl": 82, "bowling_type": "Fast",     "role": "All-Rounder", "card": "🥈"},
-            {"name": "Pat Cummins",    "country": "Australia", "ovr": 90, "bat": 60, "bowl": 93, "bowling_type": "Fast",     "role": "Bowler",      "card": "🥇"},
-            {"name": "Mitchell Starc", "country": "Australia", "ovr": 89, "bat": 42, "bowl": 91, "bowling_type": "Fast",     "role": "Bowler",      "card": "🥇"},
-            {"name": "Adam Zampa",     "country": "Australia", "ovr": 84, "bat": 28, "bowl": 85, "bowling_type": "Leg Spin", "role": "Bowler",      "card": "🥈"},
-            {"name": "Josh Hazlewood", "country": "Australia", "ovr": 87, "bat": 22, "bowl": 88, "bowling_type": "Fast",     "role": "Bowler",      "card": "🥇"},
-            {"name": "Nathan Lyon",    "country": "Australia", "ovr": 84, "bat": 35, "bowl": 85, "bowling_type": "Off Spin", "role": "Bowler",      "card": "🥈"},
+            {"name": "David Warner",   "country": "Australia", "ovr": 91, "bat": 93, "bowl": 42, "bowling_type": None,       "role": "Batter",      "card": ""},
+            {"name": "Travis Head",    "country": "Australia", "ovr": 89, "bat": 91, "bowl": 50, "bowling_type": "Off Spin", "role": "Batter",      "card": ""},
+            {"name": "Steve Smith",    "country": "Australia", "ovr": 92, "bat": 94, "bowl": 55, "bowling_type": "Leg Spin", "role": "Batter",      "card": ""},
+            {"name": "Glenn Maxwell",  "country": "Australia", "ovr": 88, "bat": 86, "bowl": 80, "bowling_type": "Off Spin", "role": "All-Rounder", "card": ""},
+            {"name": "Matthew Wade",   "country": "Australia", "ovr": 82, "bat": 80, "bowl": 15, "bowling_type": None,       "role": "WK",          "card": ""},
+            {"name": "Cameron Green",  "country": "Australia", "ovr": 84, "bat": 80, "bowl": 82, "bowling_type": "Fast",     "role": "All-Rounder", "card": ""},
+            {"name": "Pat Cummins",    "country": "Australia", "ovr": 90, "bat": 60, "bowl": 93, "bowling_type": "Fast",     "role": "Bowler",      "card": ""},
+            {"name": "Mitchell Starc", "country": "Australia", "ovr": 89, "bat": 42, "bowl": 91, "bowling_type": "Fast",     "role": "Bowler",      "card": ""},
+            {"name": "Adam Zampa",     "country": "Australia", "ovr": 84, "bat": 28, "bowl": 85, "bowling_type": "Leg Spin", "role": "Bowler",      "card": ""},
+            {"name": "Josh Hazlewood", "country": "Australia", "ovr": 87, "bat": 22, "bowl": 88, "bowling_type": "Fast",     "role": "Bowler",      "card": ""},
+            {"name": "Nathan Lyon",    "country": "Australia", "ovr": 84, "bat": 35, "bowl": 85, "bowling_type": "Off Spin", "role": "Bowler",      "card": ""},
         ],
     },
 }
@@ -467,7 +529,10 @@ def resolve_delivery(button_label: str, bowling_type: str) -> str:
     return DELIVERY_BUTTON_MAP.get(button_label, button_label)
 
 
-def get_delivery_speed(button_label: str) -> tuple:
+def get_delivery_speed(button_label: str, bowling_type: str | None = None) -> tuple:
+    """(min, max) km/h for a delivery. Medium pacers are always 110-135 km/h."""
+    if bowling_type == "Medium Pacer":
+        return MEDIUM_PACER_SPEED
     return BALL_SPEEDS.get(button_label, (100, 140))
 
 

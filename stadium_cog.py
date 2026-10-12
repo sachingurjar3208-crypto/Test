@@ -17,7 +17,6 @@ Only OWNER_ID may run these (same owner as /cardmaker).
 
 from __future__ import annotations
 
-import asyncio
 import re
 
 import discord
@@ -53,7 +52,7 @@ TYPE_CHOICES = [app_commands.Choice(name=label, value=key) for key, label in dat
 
 async def stadium_autocomplete(interaction: discord.Interaction, current: str):
     cur = current.lower()
-    names = sorted(st["name"] for st in await asyncio.to_thread(data.get_all_stadiums))
+    names = sorted(st["name"] for st in data.get_all_stadiums())
     return [app_commands.Choice(name=n, value=n) for n in names if cur in n.lower()][:25]
 
 
@@ -92,7 +91,7 @@ class StadiumCog(commands.Cog):
             )
             return
 
-        existing = await asyncio.to_thread(data.find_stadium, stadium)
+        existing = data.find_stadium(stadium)
         if existing:
             stadium = existing["name"]          # keep the exact stored spelling
         elif stadiumtype is None or not (stadiumlocat or "").strip():
@@ -109,17 +108,15 @@ class StadiumCog(commands.Cog):
                 await interaction.response.send_message("❌ `gif` must be a link starting with http:// or https://", ephemeral=True)
                 return
 
-        await asyncio.to_thread(
-            lambda: media.upsert_stadium(
-                stadium,
-                location=stadiumlocat.strip()[:100] if stadiumlocat else None,
-                soil=soiltype.value if soiltype else None,
-                stadium_type=stadiumtype.value if stadiumtype else None,
-                gif_url=gif_url,
-            )
+        media.upsert_stadium(
+            stadium,
+            location=stadiumlocat.strip()[:100] if stadiumlocat else None,
+            soil=soiltype.value if soiltype else None,
+            stadium_type=stadiumtype.value if stadiumtype else None,
+            gif_url=gif_url,
         )
 
-        st = await asyncio.to_thread(data.find_stadium, stadium)
+        st = data.find_stadium(stadium)
         embed = self._stadium_embed(st, title=("✅ Stadium updated" if existing else "✅ New stadium added"))
         await interaction.response.send_message(embed=embed)
 
@@ -129,7 +126,7 @@ class StadiumCog(commands.Cog):
     @app_commands.autocomplete(stadium=stadium_autocomplete)
     @is_owner()
     async def stadiumgif(self, interaction: discord.Interaction, stadium: str, link: str):
-        st = await asyncio.to_thread(data.find_stadium, stadium)
+        st = data.find_stadium(stadium)
         if not st:
             await interaction.response.send_message(
                 f"❌ No stadium named **{stadium}**. Pick one from the list, or add it first with `/stadium_edit`.",
@@ -140,7 +137,7 @@ class StadiumCog(commands.Cog):
         if gif_url is None:
             await interaction.response.send_message("❌ `link` must start with http:// or https://", ephemeral=True)
             return
-        await asyncio.to_thread(media.upsert_stadium, st["name"], gif_url=gif_url)
+        media.upsert_stadium(st["name"], gif_url=gif_url)
         embed = discord.Embed(title="✅ Stadium GIF saved", description=f"**{st['name']}**",
                               color=discord.Color.from_rgb(8, 22, 60))
         embed.set_image(url=gif_url)
@@ -152,7 +149,7 @@ class StadiumCog(commands.Cog):
     @app_commands.autocomplete(stadium=stadium_autocomplete)
     @is_owner()
     async def stadiumgif_remove(self, interaction: discord.Interaction, stadium: str):
-        st = await asyncio.to_thread(data.find_stadium, stadium)
+        st = data.find_stadium(stadium)
         if not st:
             await interaction.response.send_message(f"❌ No stadium named **{stadium}**.", ephemeral=True)
             return
@@ -160,17 +157,15 @@ class StadiumCog(commands.Cog):
             await interaction.response.send_message(f"**{st['name']}** has no GIF to remove.", ephemeral=True)
             return
         # "" = removed on purpose, so the built-in default GIF doesn't come back.
-        def _remove_gif():
-            media.upsert_stadium(st["name"], gif_url="")
-            media.delete_stadium_gif(st["name"])      # also clear an older-style saved GIF
-        await asyncio.to_thread(_remove_gif)
+        media.upsert_stadium(st["name"], gif_url="")
+        media.delete_stadium_gif(st["name"])      # also clear an older-style saved GIF
         await interaction.response.send_message(f"🗑️ GIF removed from **{st['name']}**.")
 
     # ── /stadiumgif_list ─────────────────────────────────────────────
     @app_commands.command(name="stadiumgif_list", description="Show which stadiums have a GIF")
     @is_owner()
     async def stadiumgif_list(self, interaction: discord.Interaction):
-        stadiums = sorted(await asyncio.to_thread(data.get_all_stadiums), key=lambda s: s["name"])
+        stadiums = sorted(data.get_all_stadiums(), key=lambda s: s["name"])
         with_gif = [s["name"] for s in stadiums if s["gif_url"]]
         without = [s["name"] for s in stadiums if not s["gif_url"]]
         embed = discord.Embed(title="🎞️ Stadium GIFs", color=discord.Color.from_rgb(8, 22, 60))
@@ -185,7 +180,7 @@ class StadiumCog(commands.Cog):
     @is_owner()
     async def stadium_list(self, interaction: discord.Interaction):
         lines = []
-        for st in sorted(await asyncio.to_thread(data.get_all_stadiums), key=lambda s: s["name"]):
+        for st in sorted(data.get_all_stadiums(), key=lambda s: s["name"]):
             lines.append(
                 f"**{st['name']}** — {st['location'] or 'Unknown'}\n"
                 f"└ {data.STADIUM_TYPES.get(st['type'], st['type'])} • "
@@ -213,7 +208,7 @@ class StadiumCog(commands.Cog):
     @is_owner()
     async def stadium_remove(self, interaction: discord.Interaction, stadium: str):
         builtin = stadium.strip().lower() in {n.lower() for n, _ in data.VENUES}
-        removed = await asyncio.to_thread(media.delete_stadium_row, stadium.strip())
+        removed = media.delete_stadium_row(stadium.strip())
         if not removed:
             await interaction.response.send_message(f"❌ No saved changes found for **{stadium}**.", ephemeral=True)
             return

@@ -20,6 +20,7 @@ from discord.ext import commands
 import card_cache
 import card_db
 import economy
+import quest
 import security
 import squad_logic as sl
 from squad_image import build_team_image, FILENAME as TEAM_IMG_NAME
@@ -37,6 +38,23 @@ PREMIUM_ROLE_ID = 1556957776415035423
 
 def _is_premium(member) -> bool:
     return any(r.id == PREMIUM_ROLE_ID for r in getattr(member, "roles", []))
+
+
+def premium_cooldown(seconds: int):
+    """Per-command cooldown for normal users. Premium members have NO cooldown.
+    Each use of this decorator has its own timer (not shared with other commands)."""
+    mapping = commands.CooldownMapping.from_cooldown(1, seconds, commands.BucketType.user)
+
+    async def predicate(ctx: commands.Context) -> bool:
+        if _is_premium(ctx.author):
+            return True
+        bucket = mapping.get_bucket(ctx.message)
+        retry_after = bucket.update_rate_limit() if bucket else None
+        if retry_after:
+            # security.py's error handler shows "Wait Xm Ys before using this again".
+            raise commands.CommandOnCooldown(bucket, retry_after, commands.BucketType.user)
+        return True
+    return commands.check(predicate)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -66,7 +84,7 @@ async def _need_debut(ctx: commands.Context) -> bool:
 def _card_line(card, extra: str = "", emojis: bool = True) -> str:
     role = ROLES.get(card_db.effective_role(card), "?")
     if emojis:
-        prefix = f"{sl.card_emoji(card)} {sl.role_emoji(card)} "
+        prefix = f"{sl.role_emoji(card)} "
     else:
         prefix = ""   # plain text for non-premium members
     return f"{prefix}**{esc(card['playername'])}** · {card['ovr']} · {role}{extra}"
@@ -84,7 +102,7 @@ def _xi_embed(member: discord.abc.User, user_row) -> discord.Embed:
             continue
         badge = " <:Captain:1558139695177932951>" if card["playername_key"] == cap_key else ""
         lines.append(
-            f"`{slot:>2}.` {sl.card_emoji(card)} **{esc(card['playername'])}** · "
+            f"`{slot:>2}.` **{esc(card['playername'])}** · "
             f"{card['ovr']} · {ROLES.get(card_db.effective_role(card), '?')}{badge}"
         )
     cards = sl.xi_cards(member.id)
@@ -388,19 +406,16 @@ class SquadCog(commands.Cog, name="Squad"):
         if card is None:
             await ctx.send(f"❌ {err}")
             return
-        from card_narratives import NARRATIVES
         styles = [s for s in (card["playstyle1"], card["playstyle2"]) if s]
         desc = (
-            f"{sl.card_emoji(card)} OVR **{card['ovr']}** · BAT **{card['bat']}** · BOWL **{card['bowl']}**\n"
+            f"OVR **{card['ovr']}** · BAT **{card['bat']}** · BOWL **{card['bowl']}**\n"
             f"{ROLES.get(card_db.effective_role(card), '?')}"
             + (f" · {HANDS.get(card['batting_hand'], '')} bat" if card["batting_hand"] else "")
             + (f" · {card_db.effective_bowling_type(card)}" if card_db.effective_bowling_type(card) else "")
             + f"\n{card['country_emoji']} {esc(card['country'])}"
         )
-        if styles:
-            desc += "\n\n**Playstyles**\n" + "\n".join(
-                f"• **{esc(s)}** — {esc(NARRATIVES.get(s, ''))}" for s in styles
-            )
+        if styles:   # names only: the effects / percentages are never shown to players
+            desc += "\n\n**Playstyles**\n" + "\n".join(f"• **{esc(s)}**" for s in styles)
         desc += f"\n\nBuy **{economy.fmt_coins(sl.buy_price(card))}** · Sell **{economy.fmt_coins(sl.sell_value(card))}**"
         embed = discord.Embed(title=esc(card["playername"]), description=desc, color=discord.Color.gold())
         await card_cache.send_embed(ctx, embed, card["image_path"])   # cached link = no upload
@@ -541,10 +556,12 @@ class SquadCog(commands.Cog, name="Squad"):
             return
         view = AutoXiView(ctx.author.id) if target.id == ctx.author.id else None
         await ctx.send(embed=_xi_embed(target, user), view=view)
+        if target.id == ctx.author.id:
+            await quest.track_and_notify(ctx, ctx.author.id, {"xi_view": 1})
 
     # -- XI image + team OVR ----------------------------------------------
     @commands.command(name="csovr")
-    @commands.cooldown(1, 10, commands.BucketType.user)
+    @premium_cooldown(30 * 60)          # normal users: 30 min, Premium: none
     async def csovr(self, ctx: commands.Context):
         """Your real playing XI as an image, with the team OVR."""
         if not await _need_debut(ctx):
@@ -752,6 +769,7 @@ class SquadCog(commands.Cog, name="Squad"):
             await ctx.send(f"❌ {err}")
             return
         await ctx.send(f"<:Captain:1558139695177932951> **{esc(card['playername'])}** is now your captain.")
+        await quest.track_and_notify(ctx, ctx.author.id, {"captain_set": 1})
 
     # -- team name -------------------------------------------------------
     @commands.command(name="csteamname")
@@ -801,6 +819,8 @@ class SquadCog(commands.Cog, name="Squad"):
         embed.add_field(name="<:Streak:1558139736617390292> Daily streak", value=str(user["daily_streak"]))
         embed.add_field(name=f"Form (last {len(form)})", value=f"{form_txt}\n{wins} win(s)" if form else form_txt)
         await ctx.send(embed=embed)
+        if target.id == ctx.author.id:
+            await quest.track_and_notify(ctx, ctx.author.id, {"profile_view": 1})
 
     # -- help ------------------------------------------------------------
     @commands.command(name="cshelp")
@@ -809,7 +829,7 @@ class SquadCog(commands.Cog, name="Squad"):
         """List the commands."""
         embed = discord.Embed(title="🏏 CricStar Help", color=discord.Color.orange())
         embed.add_field(name="Start", value=(
-            "`csdebut` create team\n`csstarterpack` first players\n`csdaily` `csweekly` (Premium) `csmonthly` free coins + player"
+            "`csdebut` create team\n`csstarterpack` first players\n`csdaily` `csweekly` (Premium) `csmonthly` free coins + player\n`csclaim` free card every hour (Premium: 35 min)"
         ), inline=False)
         embed.add_field(name="Squad", value=(
             "`cssquad` `csshow <player>` `csxi` `csovr` XI image + OVR · `csautoxi` `csautoplay` (Premium) · `csxi @user` (Premium)\n"
@@ -819,7 +839,8 @@ class SquadCog(commands.Cog, name="Squad"):
         ), inline=False)
         embed.add_field(name="Economy", value=(
             "`cspurse` `cspack` `csopen <type>`\n`csbuy <player>` `cssell <player>`\n"
-            "`cstrade @user my player | their player` (same OVR, 5,000 coins fee each) `cspending` `csleaderboard`"
+            "`cstrade @user my player | their player` (same OVR, 5,000 coins fee each) `cspending` `csleaderboard`\n"
+            "`csquest` 5 daily quests, 1 voucher each · `csdraft` use vouchers"
         ), inline=False)
         embed.add_field(name="Play", value="`csmp @user <overs>` challenge • `cscancel` cancel match", inline=False)
         await ctx.send(embed=embed)

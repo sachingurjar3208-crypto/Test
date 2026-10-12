@@ -25,9 +25,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
-import threading
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -35,7 +32,6 @@ import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
 from card_db import get_playstyle_logo, get_panel, get_country_logo, FOREGROUNDS_DIR
-import card_db
 from card_narratives import ROLE_CARD_WORD, HAND_CARD_WORD
 
 CANVAS_W, CANVAS_H = 1037, 1517
@@ -54,7 +50,7 @@ def _find_font(name: str) -> Path:
 FONT_DIR = _HERE / "fonts"
 # Drop bold display TTFs in cardmaker/fonts/ with these exact names, or the
 # code falls back to Pillow's built-in font (works, but looks plain).
-FONT_DISPLAY_BOLD = _find_font("display_bold.ttf")     # stat numbers / OVR (Bebas Neue)
+FONT_DISPLAY_BOLD = _find_font("display_bold.ttf")     # stat numbers / OVR (Jersey M54)
 FONT_LABEL = _find_font("label.ttf")                   # small caps labels
 # Display name (top-left) ONLY: Montserrat ExtraBold. Put Montserrat-ExtraBold.ttf in the
 # repo root renamed to name_font.ttf. If the file is missing the name falls back to display_bold.ttf.
@@ -79,9 +75,9 @@ NAME_MIN_SIZE = 30
 
 STAT_LEFT_CENTER = (150, 1290)   # left hexagon number
 STAT_RIGHT_CENTER = (890, 1290)  # right hexagon number
-STAT_NUMBER_SIZE = 70
-STAT_LABEL_SIZE = 30
-STAT_LABEL_OFFSET_Y = 55         # label sits this many px below the number
+STAT_NUMBER_SIZE = 260
+STAT_LABEL_SIZE = 40
+STAT_LABEL_OFFSET_Y = 65         # label sits this many px below the number (BATTING/BOWLING, moved up 40px)
 
 ROLE_CENTER = (518, 1200)        # role word (BATTER / BOWLER / WICKETKEEPER...) alone in the top centre strip
 ROLE_SIZE = 26
@@ -92,6 +88,7 @@ ROLE_SIZE = 26
 OVR_CENTER = (518, 1320)         # OVR number centre (fixed px for every card)
 OVR_SIZE = STAT_NUMBER_SIZE      # same size as the BAT / BOWL numbers
 OVR_LABEL_TEXT = "OVR"
+OVR_LABEL_OFFSET_Y = 40          # OVR word sits this many px below the number (moved up 65px)
 
 COUNTRY_CENTER = (518, 1465)     # bottom strip: "🇮🇳 India" (moved 10px down)
 COUNTRY_SIZE = 30
@@ -125,106 +122,25 @@ COUNTRY_LOGO_OFFSET_Y = -44      # logo centre is this many px above the country
 # default since a "stats panel" graphic usually spans the card. ──
 PANEL_BOX = {"x": 0, "y": 1080, "w": CANVAS_W, "h": CANVAS_H - 1080}
 
-# ── Playstyle logos: two circles in the centre band, below the role word. ──
-LOGO_CENTER_1 = (400, 1280)      # left circle  (used for slot 1 when there are 2 logos)
-LOGO_CENTER_2 = (636, 1280)      # right circle (slot 2)
-LOGO_CENTER_SINGLE = (518, 1280) # a lone logo sits in the middle
+# ── Playstyle logos (Narrative 1 / Narrative 2). ──
+# Taken from the AB De Villiers card's manual values (logo1 x+70 y-1 size 90%,
+# logo2 x-85 y0 size 97% on the old spots 400/636,1280) with the requested change:
+#   Narrative 1: 65 up, 150 left, 25 smaller  -> centre (320, 1214), size 65%
+#   Narrative 2: 65 up, 150 right, 25 smaller -> centre (701, 1215), size 72%
+# Size is in % of LOGO_BOX (110px): 65% = ~72px, 72% = ~79px (longest side).
+# Narrative 1 ALWAYS uses spot 1 and Narrative 2 ALWAYS spot 2, even with one logo.
+LOGO_CENTER_1 = (320, 1214)
+LOGO_CENTER_2 = (701, 1215)
+LOGO_SCALE_1 = 65
+LOGO_SCALE_2 = 72
 LOGO_BOX = 110                   # logo is fitted inside a LOGO_BOX x LOGO_BOX square
-
-
-# ── Startup asset cache ──────────────────────────────────────────────────────
-# Fonts and background templates used to be re-read from disk on EVERY card
-# render. Now the raw font files are loaded into RAM once (preload_assets(),
-# called at bot startup) and templates are kept in small LRU caches that notice
-# when the file on disk changes (mtime), so replacing a template still works.
-_FONT_BYTES: dict[str, bytes] = {}
-_font_tls = threading.local()            # FreeType faces are NOT shared between threads
-
-_BG_CACHE_MAX = 8                        # ~6 MB each (1037x1517 RGBA)
-_SMALL_CACHE_MAX = 24                    # logos / panels / country logos
-_bg_cache: "OrderedDict[str, tuple[int, Image.Image]]" = OrderedDict()
-_small_cache: "OrderedDict[str, tuple[int, Image.Image]]" = OrderedDict()
-_cache_lock = threading.Lock()
-_RENDER_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="card-render")
-
-
-def _font_bytes(path: Path) -> bytes | None:
-    key = str(path)
-    data = _FONT_BYTES.get(key)
-    if data is None:
-        try:
-            data = Path(path).read_bytes()
-        except OSError:
-            return None
-        _FONT_BYTES[key] = data
-    return data
-
-
-def _cached_rgba(path: str, cache: "OrderedDict", limit: int) -> Image.Image:
-    """Decoded RGBA image from an LRU cache. The returned image is SHARED and must
-    be treated as read-only (callers copy / resize / crop, never draw on it)."""
-    mtime = Path(path).stat().st_mtime_ns
-    with _cache_lock:
-        hit = cache.get(path)
-        if hit and hit[0] == mtime:
-            cache.move_to_end(path)
-            return hit[1]
-    img = Image.open(path).convert("RGBA")
-    img.load()
-    with _cache_lock:
-        cache[path] = (mtime, img)
-        cache.move_to_end(path)
-        while len(cache) > limit:
-            cache.popitem(last=False)
-    return img
-
-
-def preload_assets(background_paths: list[str] | None = None) -> None:
-    """Call once at startup (in a thread): load fonts into RAM and warm the
-    template cache. Safe to call again; failures are ignored (just slower)."""
-    for f in (FONT_DISPLAY_BOLD, FONT_LABEL, FONT_NAME):
-        _font_bytes(f)
-    for p in (background_paths or [])[:_BG_CACHE_MAX]:
-        try:
-            _cover_to_canvas_cached(p)
-        except Exception:
-            pass
-
-
-def preload_from_db() -> None:
-    """Startup preload: fonts into RAM + the background templates the most cards use.
-    Blocking (disk + SQLite): run it with asyncio.to_thread()."""
-    from collections import Counter
-    paths: list[str] = []
-    try:
-        counts = Counter(c["background"] for c in card_db.list_all_cards())
-        for name, _n in counts.most_common(_BG_CACHE_MAX):
-            row = card_db.get_background(name)
-            if row is not None and row["local_path"]:
-                paths.append(row["local_path"])
-    except Exception as e:
-        print(f"[card_image] preload: could not list backgrounds: {e}")
-    preload_assets(paths)
-    print(f"[card_image] preloaded {len(_FONT_BYTES)} font file(s) and {len(_bg_cache)} template(s)")
+# False = every card (refresh / edit / new) ALWAYS puts both logos exactly at the spots above,
+# the old per-card /logofixer values saved in the database are ignored.
+# True  = /logofixer values are added on top of these spots again.
+LOGO_USE_MANUAL_FIXER = False
 
 
 def _font(path: Path, size: int) -> ImageFont.FreeTypeFont:
-    # One FreeTypeFont per (thread, file, size), built from the in-memory font bytes.
-    cache = getattr(_font_tls, "fonts", None)
-    if cache is None:
-        cache = _font_tls.fonts = {}
-    key = (str(path), size)
-    font = cache.get(key)
-    if font is not None:
-        return font
-    try:
-        data = _font_bytes(path)
-        if data is not None:
-            font = ImageFont.truetype(io.BytesIO(data), size)
-            cache[key] = font
-            return font
-    except Exception:
-        pass
     try:
         return ImageFont.truetype(str(path), size)
     except Exception:
@@ -257,26 +173,14 @@ async def _download_image(url: str) -> Image.Image:
     it; otherwise download it once, save it forever, and use that."""
     local = _foreground_file(url)
     if local.exists():
-        # PNG decode is CPU work: keep it off the event loop.
-        img = await asyncio.to_thread(_open_local_foreground, local)
-        if img is not None:
-            return img
+        try:
+            return Image.open(local).convert("RGBA")
+        except Exception:
+            local.unlink(missing_ok=True)   # damaged copy: fetch again
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
             resp.raise_for_status()
             data = await resp.read()
-    return await asyncio.to_thread(_decode_and_save_foreground, data, local)
-
-
-def _open_local_foreground(local: Path) -> Image.Image | None:
-    try:
-        return Image.open(local).convert("RGBA")
-    except Exception:
-        local.unlink(missing_ok=True)   # damaged copy: fetch again
-        return None
-
-
-def _decode_and_save_foreground(data: bytes, local: Path) -> Image.Image:
     img = Image.open(io.BytesIO(data)).convert("RGBA")
     try:
         tmp = local.with_suffix(".tmp")
@@ -348,7 +252,7 @@ def _load_logo(pathname) -> Image.Image | None:
     if row is None:
         return None
     try:
-        return _cached_rgba(row["local_path"], _small_cache, _SMALL_CACHE_MAX)
+        return Image.open(row["local_path"]).convert("RGBA")
     except Exception:
         return None
 
@@ -362,7 +266,7 @@ def _load_panel(pathname) -> Image.Image | None:
     if row is None:
         return None
     try:
-        return _cached_rgba(row["local_path"], _small_cache, _SMALL_CACHE_MAX)
+        return Image.open(row["local_path"]).convert("RGBA")
     except Exception:
         return None
 
@@ -374,7 +278,7 @@ def _load_country_logo(country) -> Image.Image | None:
     if row is None:
         return None
     try:
-        return _cached_rgba(row["local_path"], _small_cache, _SMALL_CACHE_MAX)
+        return Image.open(row["local_path"]).convert("RGBA")
     except Exception:
         return None
 
@@ -403,24 +307,6 @@ BG_FIT_MODE = "stretch"
 # shape; a very different shape (e.g. a wide landscape image) would look badly squashed,
 # so it falls back to "cover".
 BG_MAX_STRETCH = 1.25
-
-
-def _cover_to_canvas_cached(path: str) -> Image.Image:
-    """Template fitted to the canvas, cached (shared, read-only) until the file changes."""
-    mtime = Path(path).stat().st_mtime_ns
-    with _cache_lock:
-        hit = _bg_cache.get(path)
-        if hit and hit[0] == mtime:
-            _bg_cache.move_to_end(path)
-            return hit[1]
-    fitted = _cover_to_canvas(Image.open(path).convert("RGBA"))
-    fitted.load()
-    with _cache_lock:
-        _bg_cache[path] = (mtime, fitted)
-        _bg_cache.move_to_end(path)
-        while len(_bg_cache) > _BG_CACHE_MAX:
-            _bg_cache.popitem(last=False)
-    return fitted
 
 
 def _cover_to_canvas(img: Image.Image) -> Image.Image:
@@ -456,15 +342,13 @@ async def generate_card_image(card_row, background_local_path: str) -> io.BytesI
     then hand the rest off to a worker thread via asyncio.to_thread.
     """
     fg = await _download_image(card_row["foreground_link"])
-    # A small dedicated pool (not the shared default one): card drawing is slow, so it
-    # must never use up every worker and make quick database calls wait in line.
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_RENDER_POOL, _build_card_image_sync, card_row, background_local_path, fg)
+    return await asyncio.to_thread(_build_card_image_sync, card_row, background_local_path, fg)
 
 
 def _build_card_image_sync(card_row, background_local_path: str, fg: Image.Image) -> io.BytesIO:
     """All the CPU-bound Pillow work — runs in a worker thread, never on the event loop."""
-    background = _cover_to_canvas_cached(background_local_path)   # shared: read-only
+    background = Image.open(background_local_path).convert("RGBA")
+    background = _cover_to_canvas(background)
 
     canvas = background.copy()
 
@@ -581,7 +465,7 @@ def _build_card_image_sync(card_row, background_local_path: str, fg: Image.Image
     _draw_centered(draw, ovr_center, str(card_row["ovr"]), ovr_font, GOLD)
     _draw_centered(
         draw,
-        (ovr_center[0], ovr_center[1] + STAT_LABEL_OFFSET_Y),
+        (ovr_center[0], ovr_center[1] + OVR_LABEL_OFFSET_Y),
         OVR_LABEL_TEXT, label_font, WHITE,
     )
 
@@ -591,23 +475,23 @@ def _build_card_image_sync(card_row, background_local_path: str, fg: Image.Image
         hand_center = (HAND_CENTER[0] + hand_dx, HAND_CENTER[1] + hand_dy)
         _draw_centered(draw, hand_center, hand_word, _font(FONT_LABEL, hand_size), WHITE)
 
-    # ── Playstyle logos (max 2): one sits in the middle, two fill the circles ──
+    # ── Playstyle logos (max 2): Narrative 1 left spot, Narrative 2 right spot ──
     slots = []
     for slot in (1, 2):
         logo = _load_logo(_col(card_row, f"playstyle{slot}"))
         if logo is not None:
             slots.append((slot, logo))
-    if len(slots) == 2:
-        centers = {1: LOGO_CENTER_1, 2: LOGO_CENTER_2}
-    else:
-        centers = {s: LOGO_CENTER_SINGLE for s, _ in slots}
+    # Slot 1 always sits at LOGO_CENTER_1, slot 2 always at LOGO_CENTER_2.
+    centers = {1: LOGO_CENTER_1, 2: LOGO_CENTER_2}
+    base_scale = {1: LOGO_SCALE_1, 2: LOGO_SCALE_2}
     for slot, logo in slots:
-        _draw_logo(
-            canvas, logo, centers[slot],
-            _col(card_row, f"logo{slot}_dx", 0),
-            _col(card_row, f"logo{slot}_dy", 0),
-            _col(card_row, f"logo{slot}_scale", 100),
-        )
+        if LOGO_USE_MANUAL_FIXER:
+            ldx = _col(card_row, f"logo{slot}_dx", 0)
+            ldy = _col(card_row, f"logo{slot}_dy", 0)
+            lsc = base_scale[slot] * _col(card_row, f"logo{slot}_scale", 100) / 100
+        else:
+            ldx, ldy, lsc = 0, 0, base_scale[slot]
+        _draw_logo(canvas, logo, centers[slot], ldx, ldy, lsc)
 
     # ── Country (emoji glyphs don't render via truetype fonts in Pillow,
     # so we draw the country name; the emoji is still stored in the DB and

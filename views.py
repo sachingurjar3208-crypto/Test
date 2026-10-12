@@ -3,6 +3,7 @@ import io
 import os
 import random
 import discord
+import emojis
 from discord import ui
 
 _TOSS_IMG_PATH   = os.path.join(os.path.dirname(__file__), "toss_image.png")
@@ -10,35 +11,16 @@ _TOSS_HEADS_PATH = os.path.join(os.path.dirname(__file__), "toss_heads.png")
 _TOSS_TAILS_PATH = os.path.join(os.path.dirname(__file__), "toss_tails.png")
 
 
-def _read_asset(path: str) -> bytes | None:
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except OSError:
-        return None
-
-
-# Toss pictures are tiny and sent often: read them from disk ONCE at startup.
-_TOSS_BYTES = {p: _read_asset(p) for p in (_TOSS_IMG_PATH, _TOSS_HEADS_PATH, _TOSS_TAILS_PATH)}
-
-
-def _toss_file(path: str, filename: str) -> discord.File:
-    data = _TOSS_BYTES.get(path)
-    if data is None:                       # missing at startup: fall back to the old behaviour
-        return discord.File(path, filename=filename)
-    return discord.File(io.BytesIO(data), filename=filename)
-
-
 def _toss_image_file() -> discord.File:
-    return _toss_file(_TOSS_IMG_PATH, "toss_image.png")
+    return discord.File(_TOSS_IMG_PATH, filename="toss_image.png")
 
 
 def _toss_result_file(result: str) -> tuple[discord.File, str]:
     if result == "Head" and os.path.exists(_TOSS_HEADS_PATH):
-        return _toss_file(_TOSS_HEADS_PATH, "toss_heads.png"), "toss_heads.png"
+        return discord.File(_TOSS_HEADS_PATH, filename="toss_heads.png"), "toss_heads.png"
     if result == "Tail" and os.path.exists(_TOSS_TAILS_PATH):
-        return _toss_file(_TOSS_TAILS_PATH, "toss_tails.png"), "toss_tails.png"
-    return _toss_file(_TOSS_IMG_PATH, "toss_image.png"), "toss_image.png"
+        return discord.File(_TOSS_TAILS_PATH, filename="toss_tails.png"), "toss_tails.png"
+    return discord.File(_TOSS_IMG_PATH, filename="toss_image.png"), "toss_image.png"
 
 from game import GameState, _pname
 from logic import calculate_outcome, player_attributes
@@ -231,6 +213,7 @@ async def _resume_prompt(channel: discord.TextChannel, game: GameState) -> bool:
         else:
             result_embed = build_result_embed(game)
             await channel.send(embed=result_embed)
+            await _send_match_summary(channel, game)
             active_games.pop(channel.id, None)
         return True
 
@@ -303,6 +286,7 @@ from data import (
     TOSS_HEAD_EMOJI, TOSS_TAIL_EMOJI, TIMELINE_EMOJIS,
     FAST_STAGE1, FAST_STAGE2,
     OFF_SPIN_BUTTONS, LEG_SPIN_BUTTONS,
+    is_two_stage, get_two_stage_buttons, get_spin_buttons,
     BATTING_BUTTONS, SHOT_BUTTON_MAP,
     get_delivery_speed, resolve_delivery, BOWLING_TYPE_ICON,
     DELIVERY_BUTTON_MAP,
@@ -330,32 +314,44 @@ def save_game_innings_stats(game, batting_user_id=None, bowling_user_id=None, is
         print(f"[career_stats] save failed: {type(e).__name__}: {e}")
 
 
-async def save_game_innings_stats_async(*args, **kwargs):
-    """Same as save_game_innings_stats, but the SQLite writes run in a worker thread."""
-    await asyncio.to_thread(save_game_innings_stats, *args, **kwargs)
-
-
 def get_career_stats(user_id, player_name):
-    return {}
+    """ALL-TIME career totals of this user's card (zeros if never played)."""
+    try:
+        from career_stats import _key_for, get_career_personal
+        key = _key_for(player_name)
+        return get_career_personal(user_id, key) if key else {}
+    except Exception as e:
+        print(f"[stats] career lookup failed: {type(e).__name__}: {e}")
+        return {}
 from match_records import record_match_result as _record_match_result
 
 
-async def _save_match_record_async(game):
-    """_save_match_record, run in a worker thread (match_records + economy are SQLite)."""
-    await asyncio.to_thread(_save_match_record, game)
+async def _flush_quest_notes(channel, game):
+    """Tell the players which daily quests they just finished (never raises)."""
+    try:
+        import quest
+        await quest.flush_notes(channel, [game.batting_user_id, game.bowling_user_id])
+    except Exception as e:
+        print(f"[quest] announce failed: {type(e).__name__}: {e}")
 
 
 def _save_match_record(game):
     """Derive winner/loser and persist to match_records. Ignores ties."""
     t1 = game.runs[0]
     t2 = game.runs[1]
-    if t1 == t2:
-        return  # tie — don't record
     # After start_second_innings():
     #   bowling_user_id  = innings-1 batter (defending team)
     #   batting_user_id  = innings-2 batter (chasing team)
     inn1_uid = game.bowling_user_id
     inn2_uid = game.batting_user_id
+    # Daily quests (real matches only: practice never calls this). Ties count as played.
+    try:
+        import quest
+        quest.on_match_end(game, inn1_uid, inn2_uid, t1, t2)
+    except Exception as e:
+        print(f"[quest] match tracking failed: {type(e).__name__}: {e}")
+    if t1 == t2:
+        return  # tie — don't record
     if t2 > t1:
         winner_id, loser_id = inn2_uid, inn1_uid
         winner_score, loser_score = t2, t1
@@ -363,13 +359,13 @@ def _save_match_record(game):
         winner_id, loser_id = inn1_uid, inn2_uid
         winner_score, loser_score = t1, t2
     try:
-        _record_match_result(winner_id, loser_id, winner_score, loser_score, game.overs)
+        game.match_record_id = _record_match_result(winner_id, loser_id, winner_score, loser_score, game.overs)
     except Exception as e:
         print(f"[match_records] Failed to save result: {e}")
     # Economy: reward winner and loser with coins
     try:
         from economy import reward_match_winner
-        reward_match_winner(str(winner_id), str(loser_id))
+        reward_match_winner(str(winner_id), str(loser_id), game.overs)
     except Exception as e:
         print(f"[economy] Failed to reward match coins: {e}")
 try:
@@ -396,47 +392,6 @@ except ImportError:
 
     def get_umpire_gif(*args, **kwargs):
         return None
-
-def _collect_gif_urls(outcome, sname, bname, bowler_wickets_before, wkts_now,
-                      striker_runs_before, runs_after) -> list[str]:
-    """Blocking (SQLite) GIF lookups for one ball. Runs in a worker thread."""
-    gif_urls: list[str] = []
-
-    if outcome in ("4", "6"):
-        event = "four" if outcome == "4" else "six"
-        gif = get_player_media(sname, event)
-        if gif:
-            gif_urls.append(gif)
-    elif outcome == "W":
-        if wkts_now >= 5 and bowler_wickets_before < 5:
-            gif = get_player_media(bname, "5wicket")
-        else:
-            gif = get_player_media(bname, "wicket")
-        if gif:
-            gif_urls.append(gif)
-
-    # Umpire GIFs (global — fire for every player on top of player GIFs)
-    _umpire_event = {
-        "4": "four", "6": "six", "W": "out",
-        "Wd": "wide", "NB": "noball", "NB+1": "noball",
-    }.get(outcome)
-    if _umpire_event:
-        ump_gif = get_umpire_gif(_umpire_event)
-        if ump_gif:
-            gif_urls.append(ump_gif)
-
-    # Batting milestone GIFs (50, 100, 150, …)
-    if outcome in ("1", "2", "3", "4", "6"):
-        for milestone in (50, 100, 150, 200, 250, 300):
-            if striker_runs_before < milestone <= runs_after:
-                gif = get_milestone_gif(sname, str(milestone))
-                if not gif:
-                    gif = get_player_media(sname, str(milestone))
-                if gif:
-                    gif_urls.append(gif)
-                break
-    return gif_urls
-
 
 active_games: dict[int, GameState] = {}
 
@@ -664,7 +619,25 @@ class _TimeoutMixin:
     Set view._channel = channel after creating the view.
     Call self.stop() in every successful callback so the timer cancels.
     """
-    _channel: discord.TextChannel | None = None
+    _message: discord.Message | None = None
+
+    # Every prompt sets `view._channel = channel` right after it is created. We
+    # use that moment to mark this view as the game's CURRENT prompt, so an
+    # older / leftover view that times out later can never abandon a match
+    # that has already moved on.
+    @property
+    def _channel(self):
+        return self.__dict__.get("_channel_val")
+
+    @_channel.setter
+    def _channel(self, ch):
+        self.__dict__["_channel_val"] = ch
+        g = getattr(self, "game", None)
+        if g is not None:
+            try:
+                g._live_view = self
+            except Exception:
+                pass
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -726,6 +699,11 @@ class _TimeoutMixin:
         if not ch or not game:
             return
         if active_games.get(ch.id) is not game:
+            return
+        # A view that is no longer the game's current prompt (already answered,
+        # replaced, or left over) must NEVER abandon the match or fine anyone.
+        live = game.__dict__.get("_live_view")
+        if live is not None and live is not self:
             return
         if game.__dict__.get("_afk_sent"):
             return
@@ -813,6 +791,16 @@ def _drs_overturn_chance(delivery_internal: str, shot_internal: str) -> float:
     return 0.40
 
 
+async def _send_match_summary(channel, game) -> None:
+    """Last message of a finished match: the Cricket Star SUMMARY card (never breaks the match end)."""
+    try:
+        from match_summary import build_summary_png
+        png = await asyncio.to_thread(build_summary_png, game)
+        await channel.send(file=discord.File(io.BytesIO(png), filename="match_summary.png"))
+    except Exception as e:
+        print(f"[summary] card failed: {type(e).__name__}: {e}")
+
+
 async def _get_card_image_bytes(player: dict) -> bytes | None:
     try:
         bg_pathname = player.get("background_pathname") or ""
@@ -823,13 +811,12 @@ async def _get_card_image_bytes(player: dict) -> bytes | None:
         return None
 
 
-async def _bat_stats_file(user_id: int, player: dict) -> discord.File | None:
+async def _bat_stats_file(user_id: int, player: dict, status: str = "", filename: str = "bat_stats.png") -> discord.File | None:
     try:
-        name     = _pname(player)
-        stats    = get_career_stats(str(user_id), name)
-        card_img = await _get_card_image_bytes(player)
-        img      = generate_bat_card(name, stats, card_image_bytes=card_img)
-        return discord.File(fp=io.BytesIO(img), filename="bat_stats.png")
+        name  = _pname(player)
+        stats = get_career_stats(str(user_id), name)
+        img   = await asyncio.to_thread(generate_bat_card, name, stats, None, status)
+        return discord.File(fp=io.BytesIO(img), filename=filename)
     except Exception as e:
         print(f"[stats] bat card error: {e}")
         return None
@@ -837,10 +824,9 @@ async def _bat_stats_file(user_id: int, player: dict) -> discord.File | None:
 
 async def _bowl_stats_file(user_id: int, player: dict) -> discord.File | None:
     try:
-        name     = _pname(player)
-        stats    = get_career_stats(str(user_id), name)
-        card_img = await _get_card_image_bytes(player)
-        img      = generate_bowl_card(name, stats, card_image_bytes=card_img)
+        name  = _pname(player)
+        stats = get_career_stats(str(user_id), name)
+        img   = await asyncio.to_thread(generate_bowl_card, name, stats, None, "CURRENT BOWLER")
         return discord.File(fp=io.BytesIO(img), filename="bowl_stats.png")
     except Exception as e:
         print(f"[stats] bowl card error: {e}")
@@ -921,7 +907,7 @@ async def _send_bowling_prompt(
     # (the flag above is already cleared by the time the batter plays).
     game.current_ball_free_hit = is_free_hit
 
-    if btype == "Fast":
+    if is_two_stage(btype):   # Fast + Medium Pacer
         view = FastBowlStage1View(game, is_free_hit=is_free_hit)
     else:
         view = BowlingView(game, is_free_hit=is_free_hit)
@@ -936,11 +922,31 @@ async def _send_next_bowler_prompt(channel: discord.TextChannel, game: GameState
     xi_embed = build_playing_xi_embed(game.get_bowling_team())
     nb_view  = NextBowlerView(game)
     nb_view._channel = channel
-    await channel.send(
+    msg = await channel.send(
         content=f"Over is up — choose your next bowler {game.bowling_user.mention}",
         embed=xi_embed,
         view=nb_view,
     )
+    nb_view._message = msg
+
+
+async def _send_next_batsman_prompt(
+    channel: discord.TextChannel, game: GameState, *, content: str | None = None
+):
+    """Prompt the batting captain to choose the next batter."""
+    try:
+        xi_embed = build_playing_xi_embed(game.get_batting_team())
+    except Exception as e:
+        print(f"[wicket] XI embed error: {e}")
+        xi_embed = None
+    nb_view = NextBatsmanView(game)
+    nb_view._channel = channel
+    msg = await channel.send(
+        content=content or f"Choose your next batter {game.batting_user.mention}",
+        embed=xi_embed,
+        view=nb_view,
+    )
+    nb_view._message = msg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -981,6 +987,7 @@ async def _process_delivery(
     # The shot is being played now, so this delivery is no longer "pending" —
     # clear it so match-recovery (_resume_prompt) doesn't think a shot is
     # still waiting to be picked once this ball has actually been bowled.
+    _announced_speed               = game.pending_delivery_speed
     game.pending_delivery          = None
     game.pending_delivery_internal = None
     game.pending_delivery_speed    = None
@@ -1002,8 +1009,9 @@ async def _process_delivery(
     bname = _pname(bowler)
     sname = _pname(striker)
 
-    speed_range  = get_delivery_speed(delivery_button)
-    speed        = random.uniform(*speed_range)
+    # Same speed that was announced ("is coming with X kmph"); fall back to a fresh roll.
+    speed_range  = get_delivery_speed(delivery_button, bowler.get("bowling_type"))
+    speed        = _announced_speed if _announced_speed is not None else random.uniform(*speed_range)
     current_over = game.current_legal_balls // 6
 
     if shot_button == "Leave":
@@ -1143,15 +1151,47 @@ async def _process_delivery(
             game.rotate_strike()
 
     # ── GIF collection ────────────────────────────────────────────────────
-    # All GIF lookups are SQLite reads: done together in ONE worker thread so the
-    # event loop (and Discord's gateway heartbeat) never waits on the database.
-    gif_urls: list[str] = await asyncio.to_thread(
-        _collect_gif_urls,
-        outcome, sname, bname, bowler_wickets_before,
-        game.bowler_stats.get(bname, {}).get("wickets", 0),
-        striker_runs_before,
-        game.batsman_stats.get(sname, {}).get("runs", 0),
-    )
+    gif_urls: list[str] = []
+
+    if outcome in ("4", "6"):
+        event = "four" if outcome == "4" else "six"
+        gif = get_player_media(sname, event)
+        if gif:
+            gif_urls.append(gif)
+    elif outcome == "W":
+        wkts_now = game.bowler_stats.get(bname, {}).get("wickets", 0)
+        if wkts_now >= 5 and bowler_wickets_before < 5:
+            gif = get_player_media(bname, "5wicket")
+        else:
+            gif = get_player_media(bname, "wicket")
+        if gif:
+            gif_urls.append(gif)
+
+    # Umpire GIFs (global — fire for every player on top of player GIFs)
+    _umpire_event = {
+        "4": "four", "6": "six", "W": "out",
+        "Wd": "wide", "NB": "noball", "NB+1": "noball",
+    }.get(outcome)
+    if _umpire_event:
+        ump_gif = get_umpire_gif(_umpire_event)
+        if ump_gif:
+            gif_urls.append(ump_gif)
+
+    # Batting milestone GIFs (50, 100, 150, …)
+    if outcome in ("1", "2", "3", "4", "6"):
+        runs_after = game.batsman_stats.get(sname, {}).get("runs", 0)
+        for milestone in (50, 100, 150, 200, 250, 300):
+            if striker_runs_before < milestone <= runs_after:
+                if milestone in (50, 100):
+                    _m_emoji = emojis.CENTURY if milestone == 100 else emojis.HALFCENTURY
+                    _m_word = "CENTURY" if milestone == 100 else "HALF-CENTURY"
+                    commentary = f"{commentary}\n{_m_emoji} **{sname}** reaches a {_m_word}! ({runs_after})"
+                gif = get_milestone_gif(sname, str(milestone))
+                if not gif:
+                    gif = get_player_media(sname, str(milestone))
+                if gif:
+                    gif_urls.append(gif)
+                break
 
     # ── Acknowledge the shot button (remove it from the message) ─────────
     # BUG FIX #4: always ack the interaction immediately to avoid
@@ -1211,11 +1251,13 @@ async def _process_delivery(
             if game.innings == 1:
                 await _do_innings_break(channel, game, commentary, embed, gif_urls, interaction)
             else:
-                await save_game_innings_stats_async(game, game.batting_user_id, game.bowling_user_id, is_final=True)
-                await _save_match_record_async(game)
+                save_game_innings_stats(game, game.batting_user_id, game.bowling_user_id, is_final=True)
+                _save_match_record(game)
                 await _send_commentary_with_gifs(channel, commentary, embed, gif_urls, interaction)
                 result_embed = build_result_embed(game)
                 await channel.send(embed=result_embed)
+                await _send_match_summary(channel, game)
+                await _flush_quest_notes(channel, game)
                 active_games.pop(channel.id, None)
             return
 
@@ -1276,10 +1318,11 @@ async def _handle_wicket_fall(channel, game: GameState):
         if game.innings == 1:
             await _do_innings_break_allout(channel, game)
         else:
-            await save_game_innings_stats_async(game, game.batting_user_id, game.bowling_user_id, is_final=True)
-            await _save_match_record_async(game)
+            save_game_innings_stats(game, game.batting_user_id, game.bowling_user_id, is_final=True)
+            _save_match_record(game)
             result_embed = build_result_embed(game)
             await channel.send(embed=result_embed)
+            await _flush_quest_notes(channel, game)
             active_games.pop(channel.id, None)
         return
 
@@ -1289,18 +1332,8 @@ async def _handle_wicket_fall(channel, game: GameState):
     # add_wicket() only appends to dismissed[], it doesn't clear game.striker).
     game.striker = None
 
-    try:
-        xi_embed = build_playing_xi_embed(game.get_batting_team())
-    except Exception as e:
-        print(f"[wicket] XI embed error: {e}")
-        xi_embed = None
-
-    nb_view = NextBatsmanView(game)
-    nb_view._channel = channel
-    await channel.send(
-        content=f"Wicket! Choose your next batter {game.batting_user.mention}",
-        embed=xi_embed,
-        view=nb_view,
+    await _send_next_batsman_prompt(
+        channel, game, content=f"Wicket! Choose your next batter {game.batting_user.mention}"
     )
 
 
@@ -1310,14 +1343,14 @@ async def _handle_wicket_fall(channel, game: GameState):
 
 async def _do_innings_break(channel, game: GameState, commentary, embed, gif_urls=None, interaction=None):
     """End of innings via overs exhausted: save stats, send commentary, start break."""
-    await save_game_innings_stats_async(game, game.batting_user_id, game.bowling_user_id)
+    save_game_innings_stats(game, game.batting_user_id, game.bowling_user_id)
     await _send_commentary_with_gifs(channel, commentary, embed, gif_urls or [], interaction)
     await _start_second_innings(channel, game)
 
 
 async def _do_innings_break_allout(channel, game: GameState):
     """End of innings via all-out: commentary already sent, just announce, save & start break."""
-    await save_game_innings_stats_async(game, game.batting_user_id, game.bowling_user_id)
+    save_game_innings_stats(game, game.batting_user_id, game.bowling_user_id)
     team_name = game.get_batting_team().get("name", "The batting team")
     total_runs = game.current_runs
     overs_used = game.overs_str()
@@ -1679,8 +1712,8 @@ class StrikerDesignateView(_TimeoutMixin, ui.View):
 
             async def _send_openers_info():
                 f1, f2 = await asyncio.gather(
-                    _bat_stats_file(self.game.batting_user_id, striker),
-                    _bat_stats_file(self.game.batting_user_id, non_striker),
+                    _bat_stats_file(self.game.batting_user_id, striker, "ON STRIKE", "bat_striker.png"),
+                    _bat_stats_file(self.game.batting_user_id, non_striker, "NON-STRIKER", "bat_nonstriker.png"),
                 )
                 files = [f for f in (f1, f2) if f]
                 await channel.send(
@@ -1791,6 +1824,20 @@ _FAST_STAGE2_STYLES = {
     "Yorker":  discord.ButtonStyle.secondary,
 }
 
+# Medium pacer — deliberately different colours from the fast bowler's set
+_MEDIUM_STAGE1_STYLES = {
+    "Outswing": discord.ButtonStyle.success,
+    "Inswing":  discord.ButtonStyle.primary,
+    "Cutter":   discord.ButtonStyle.danger,
+    "Slower":   discord.ButtonStyle.success,
+}
+_MEDIUM_STAGE2_STYLES = {
+    "Bouncer":     discord.ButtonStyle.primary,
+    "Yorker":      discord.ButtonStyle.danger,
+    "Good Length": discord.ButtonStyle.success,
+    "Full":        discord.ButtonStyle.primary,
+}
+
 
 class FastBowlStage1View(_TimeoutMixin, ui.View):
     """Fast bowling — ONE message, two rows.
@@ -1808,14 +1855,22 @@ class FastBowlStage1View(_TimeoutMixin, ui.View):
         self._stage1_btns: list[ui.Button] = []
         self._stage2_btns: list[ui.Button] = []
 
-        for label in FAST_STAGE1:
-            style = _FAST_STAGE1_STYLES.get(label, discord.ButtonStyle.secondary)
+        # Fast bowler and Medium pacer share this view; only the buttons / colours differ.
+        self.btype = (game.current_bowler or {}).get("bowling_type", "Fast")
+        stage1_labels, stage2_labels = get_two_stage_buttons(self.btype)
+        if self.btype == "Medium Pacer":
+            self._s1_styles, self._s2_styles = _MEDIUM_STAGE1_STYLES, _MEDIUM_STAGE2_STYLES
+        else:
+            self._s1_styles, self._s2_styles = _FAST_STAGE1_STYLES, _FAST_STAGE2_STYLES
+
+        for label in stage1_labels:
+            style = self._s1_styles.get(label, discord.ButtonStyle.secondary)
             btn   = ui.Button(label=label, style=style, row=0)
             btn.callback = self._make_stage1_callback(label)
             self._stage1_btns.append(btn)
             self.add_item(btn)
 
-        for label in FAST_STAGE2:
+        for label in stage2_labels:
             # Locked + grey until step 1 is chosen
             btn = ui.Button(label=label, style=discord.ButtonStyle.secondary, row=1, disabled=True)
             btn.callback = self._make_stage2_callback(label)
@@ -1842,7 +1897,7 @@ class FastBowlStage1View(_TimeoutMixin, ui.View):
             # Row 1 -> unlock with the normal colours
             for b in self._stage2_btns:
                 b.disabled = False
-                b.style    = _FAST_STAGE2_STYLES.get(b.label, discord.ButtonStyle.secondary)
+                b.style    = self._s2_styles.get(b.label, discord.ButtonStyle.secondary)
 
             try:
                 # view only — keeps the existing message text/embed as it is
@@ -1865,7 +1920,7 @@ class FastBowlStage1View(_TimeoutMixin, ui.View):
             self.game.pending_delivery_internal = delivery_internal
             self.game.phase = "bat_select"
 
-            speed    = random.uniform(*get_delivery_speed(delivery_button))
+            speed    = random.uniform(*get_delivery_speed(delivery_button, self.btype))
             combined = f"{self.stage1_choice} {delivery_button}"
             # Cached so a failed send can be retried (or _resume_prompt used)
             # with the exact same speed/label instead of losing it.
@@ -1901,6 +1956,15 @@ _SPIN_STYLES = {
     "Slider":   discord.ButtonStyle.success,
 }
 
+# Orthodox spinner — own colour set
+_ORTHODOX_STYLES = {
+    "Arm Ball":    discord.ButtonStyle.primary,
+    "Top Spinner": discord.ButtonStyle.danger,
+    "Doosra":      discord.ButtonStyle.success,
+    "Carrom":      discord.ButtonStyle.primary,
+    "Slider":      discord.ButtonStyle.success,
+}
+
 
 class BowlingView(_TimeoutMixin, ui.View):
     """Single-step bowling view for Off Spin and Leg Spin."""
@@ -1913,9 +1977,10 @@ class BowlingView(_TimeoutMixin, ui.View):
 
     def _add_buttons(self):
         btype   = self.game.current_bowler.get("bowling_type", "Off Spin") if self.game.current_bowler else "Off Spin"
-        buttons = OFF_SPIN_BUTTONS if btype == "Off Spin" else LEG_SPIN_BUTTONS
+        buttons = get_spin_buttons(btype)
+        styles  = _ORTHODOX_STYLES if btype == "Orthodox" else _SPIN_STYLES
         for i, label in enumerate(buttons):
-            style = _SPIN_STYLES.get(label, discord.ButtonStyle.secondary)
+            style = styles.get(label, discord.ButtonStyle.secondary)
             btn   = ui.Button(label=label, style=style, row=i // 3)
             btn.callback = self._make_callback(label)
             self.add_item(btn)
@@ -1932,7 +1997,7 @@ class BowlingView(_TimeoutMixin, ui.View):
             self.game.pending_delivery_internal = delivery_internal
             self.game.phase = "bat_select"
 
-            speed = random.uniform(*get_delivery_speed(delivery_button))
+            speed = random.uniform(*get_delivery_speed(delivery_button, btype))
             self.game.pending_delivery_speed = speed
             self.game.pending_stage1_choice  = ""
 
@@ -2149,7 +2214,7 @@ class DRSView(ui.View):
                         content=f"{NOT_OUT_EMOJI} **NOT OUT — Decision Overturned!** The batsman stays at the crease!"
                     )
 
-                _notout_gif = await asyncio.to_thread(get_umpire_gif, "notout")
+                _notout_gif = get_umpire_gif("notout")
                 if _notout_gif:
                     await self.channel.send(_notout_gif)
 
@@ -2238,11 +2303,224 @@ class DRSView(ui.View):
 # Next batsman
 # ─────────────────────────────────────────────────────────────────────────────
 
-class NextBatsmanView(_TimeoutMixin, ui.View):
+async def _close_swap_views(swaps) -> None:
+    """Grey out / close Impact Player lists whose origin prompt is over."""
+    for sv in swaps:
+        if sv.is_finished():
+            continue            # already used (or timed out) - leave its message alone
+        sv.stop()
+        inter = getattr(sv, "_interaction", None)
+        if inter is not None:
+            try:
+                await inter.edit_original_response(
+                    content="⛔ Impact Player list closed — the selection was already made.",
+                    view=None,
+                )
+            except Exception:
+                pass
+
+
+class _ImpactButtonMixin:
+    """Adds an optional Impact Player button next to a next-bowler / next-
+    batsman prompt. One tap opens an ephemeral ImpactPlayerSwapView; the
+    button goes grey and disabled the moment that team's one sub is used."""
+
+    def stop(self):
+        """When the normal bowler / batter list is answered (or replaced), the
+        Impact Player list that was opened from it is closed and greyed out, so
+        it can never pick a bowler / batter afterwards."""
+        super().stop()
+        swaps = list(self.__dict__.get("_swap_views", []))
+        if swaps:
+            try:
+                asyncio.get_running_loop().create_task(_close_swap_views(swaps))
+            except RuntimeError:
+                pass
+
+    def _add_impact_button(self, uid: int, kind: str):
+        game = self.game
+        used = game.impact_used.get(uid, False)
+        if not used and not game.impact_subs_pool.get(uid):
+            return  # team never nominated any subs — keep the UI clean
+        btn = ui.Button(
+            label="Impact Player used" if used else "🔁 Impact Player",
+            style=discord.ButtonStyle.secondary if used else discord.ButtonStyle.primary,
+            disabled=used,
+            row=1,
+        )
+
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != uid:
+                await interaction.response.send_message(
+                    "Only that team's captain can make this substitution!", ephemeral=True
+                )
+                return
+            if not game.impact_available(uid):
+                await interaction.response.send_message(
+                    "Your Impact Player sub has already been used this match.", ephemeral=True
+                )
+                return
+            if self.is_finished():
+                await interaction.response.send_message(
+                    "This selection is already done — Impact Player is closed for it.", ephemeral=True
+                )
+                return
+            swap_view = ImpactPlayerSwapView(game, uid, origin_view=self, origin_kind=kind)
+            swap_view._interaction = interaction
+            self.__dict__.setdefault("_swap_views", []).append(swap_view)
+            await interaction.response.send_message(
+                content="🔁 **Impact Player** — choose your substitute.",
+                view=swap_view,
+                ephemeral=True,
+            )
+
+        btn.callback = callback
+        self.add_item(btn)
+
+
+class ImpactPlayerSwapView(ui.View):
+    """Ephemeral 2-step flow: pick the bench sub coming IN, then the XI
+    player going OUT. Only the captain who opened it can use it. Confirming
+    uses up that team's one Impact Player swap for the whole match."""
+
+    def __init__(self, game: GameState, uid: int, origin_view, origin_kind: str):
+        super().__init__(timeout=120)
+        self.game = game
+        self.uid = uid
+        self.origin_view = origin_view
+        self.origin_kind = origin_kind  # "bowler" or "batsman"
+        self.incoming: dict | None = None
+        self._add_incoming_select()
+
+    def _add_incoming_select(self):
+        pool = self.game.impact_subs_pool.get(self.uid, [])
+        options = [
+            discord.SelectOption(
+                label=_pname(p),
+                description=f"{p.get('role', '?')} | OVR:{p.get('ovr', '?')}",
+                value=_pname(p),
+            )
+            for p in pool[:25]
+        ]
+        if not options:
+            options = [discord.SelectOption(label="No subs available", value="none")]
+        select = ui.Select(placeholder="Choose your Impact Player substitute", options=options)
+        select.callback = self._incoming_callback
+        self.add_item(select)
+
+    async def _origin_closed(self, interaction: discord.Interaction) -> bool:
+        """True (and the user is told) if the normal list this was opened from is already answered."""
+        if self.origin_view is not None and self.origin_view.is_finished():
+            self.stop()
+            try:
+                await interaction.response.edit_message(
+                    content="⛔ Impact Player list closed — the selection was already made.", view=None
+                )
+            except Exception:
+                pass
+            return True
+        return False
+
+    async def _incoming_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("This isn't your substitution.", ephemeral=True)
+            return
+        if await self._origin_closed(interaction):
+            return
+        name = interaction.data["values"][0]
+        if name == "none":
+            await interaction.response.send_message("You have no subs left to bring on.", ephemeral=True)
+            return
+        pool = self.game.impact_subs_pool.get(self.uid, [])
+        incoming = next((p for p in pool if _pname(p) == name), None)
+        if incoming is None:
+            await interaction.response.send_message("That sub is no longer available.", ephemeral=True)
+            return
+        self.incoming = incoming
+        self.clear_items()
+        self._add_outgoing_select()
+        await interaction.response.edit_message(
+            content=f"🔁 Bringing on **{name}** — who comes off?",
+            view=self,
+        )
+
+    def _add_outgoing_select(self):
+        team = self.game.teams.get(self.uid, {})
+        players = self.game._team_players(team)
+        on_field = {
+            _pname(self.game.striker),
+            _pname(self.game.non_striker),
+            _pname(self.game.current_bowler),
+        }
+        options = [
+            discord.SelectOption(
+                label=_pname(p),
+                description=f"{p.get('role', '?')} | OVR:{p.get('ovr', '?')}",
+                value=_pname(p),
+            )
+            for p in players
+            if _pname(p) and _pname(p) not in on_field
+        ][:25]
+        if not options:
+            options = [discord.SelectOption(label="No eligible player to replace", value="none")]
+        select = ui.Select(placeholder="Choose who comes off", options=options)
+        select.callback = self._outgoing_callback
+        self.add_item(select)
+
+    async def _outgoing_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("This isn't your substitution.", ephemeral=True)
+            return
+        if await self._origin_closed(interaction):
+            return
+        outgoing_name = interaction.data["values"][0]
+        if outgoing_name == "none":
+            await interaction.response.send_message(
+                "No one on your team can be replaced right now.", ephemeral=True
+            )
+            return
+        ok = self.game.apply_impact_sub(self.uid, self.incoming, outgoing_name)
+        if not ok:
+            await interaction.response.send_message("That player couldn't be found — try again.", ephemeral=True)
+            return
+        self.stop()
+        incoming_name = _pname(self.incoming)
+        await interaction.response.edit_message(
+            content=f"✅ **{incoming_name}** is on in place of **{outgoing_name}**.",
+            view=None,
+        )
+
+        channel = interaction.channel
+        team_name = self.game.teams.get(self.uid, {}).get("name", "Team")
+        await channel.send(
+            f"🔁 **Impact Player!** {team_name} bring on **{incoming_name}** "
+            f"in place of **{outgoing_name}**."
+        )
+
+        # The original prompt's dropdown was built before this swap, so it
+        # won't offer the new player — retire it and send a fresh one.
+        old_view = self.origin_view
+        old_msg  = getattr(old_view, "_message", None)
+        if old_view is not None:
+            old_view.stop()
+        if old_msg is not None:
+            try:
+                await old_msg.edit(view=None)
+            except Exception:
+                pass
+
+        if self.origin_kind == "bowler":
+            await _send_next_bowler_prompt(channel, self.game)
+        else:
+            await _send_next_batsman_prompt(channel, self.game)
+
+
+class NextBatsmanView(_ImpactButtonMixin, _TimeoutMixin, ui.View):
     def __init__(self, game: GameState):
         super().__init__(timeout=VIEW_TIMEOUT)
         self.game = game
         self._add_dropdown()
+        self._add_impact_button(game.batting_user_id, "batsman")
 
     def _add_dropdown(self):
         available = sorted(self.game.get_available_batsmen(), key=lambda p: p.get("bat", 0), reverse=True)
@@ -2289,7 +2567,7 @@ class NextBatsmanView(_TimeoutMixin, ui.View):
             pass  # cosmetic only
 
         async def _work():
-            bat_file = await _bat_stats_file(self.game.batting_user_id, player)
+            bat_file = await _bat_stats_file(self.game.batting_user_id, player, "NEW BATTER")
             files = [bat_file] if bat_file else []
             await channel.send(
                 content=f"**{name}** ({player.get('ovr','?')}) comes to the crease",
@@ -2315,11 +2593,12 @@ class NextBatsmanView(_TimeoutMixin, ui.View):
 # Next bowler
 # ─────────────────────────────────────────────────────────────────────────────
 
-class NextBowlerView(_TimeoutMixin, ui.View):
+class NextBowlerView(_ImpactButtonMixin, _TimeoutMixin, ui.View):
     def __init__(self, game: GameState):
         super().__init__(timeout=VIEW_TIMEOUT)
         self.game = game
         self._add_dropdown()
+        self._add_impact_button(game.bowling_user_id, "bowler")
 
     def _add_dropdown(self):
         available = self.game.get_available_bowlers()

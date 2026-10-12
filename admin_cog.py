@@ -3,19 +3,27 @@
     admin card give @user <card name>
     admin coin give @user <coins>
     admin coin remove @user <coins>
-    admin player reset @user all
+    admin player reset @user all      (cards only)
+    admin reset all @user             (coins -> 0 AND all cards removed)
+    admin user top [20-50] [coins|cards]   (owner / admin role only)
+    admin voucher give @user <n>
+    admin voucher remove @user <n>
+    admin voucher check @user
+    admin quest reset @user      (clears today's quest progress for that user)
 """
 from __future__ import annotations
-
-import asyncio
 
 import discord
 from discord.ext import commands
 
 import card_db
+import draft_config as cfg
 import economy
+import emojis
+import quest
 import security
 import squad_logic as sl
+from bot_guard import ADMIN_GUILD_ID
 from security import esc
 
 ADMIN_ROLE_IDS = {1556267277249155156, *security.FULL_ADMIN_ROLE_IDS}
@@ -31,6 +39,15 @@ def admin_only():
     return commands.check(_has_admin_role)
 
 
+def owner_or_admin():
+    """Bot owner OR a member with an admin role."""
+    async def predicate(ctx: commands.Context) -> bool:
+        if await ctx.bot.is_owner(ctx.author) or _has_admin_role(ctx):
+            return True
+        raise commands.NotOwner("Only the bot owner or an admin can use this.")
+    return commands.check(predicate)
+
+
 class AdminCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -42,7 +59,13 @@ class AdminCog(commands.Cog):
             "`admin card give @user <card name>`\n"
             "`admin coin give @user <coins>`\n"
             "`admin coin remove @user <coins>`\n"
-            "`admin player reset @user all`"
+            "`admin player reset @user all`\n"
+            "`admin reset all @user`\n"
+            "`admin user top [20-50] [coins|cards]`\n"
+            "`admin voucher give @user <number>`\n"
+            "`admin voucher remove @user <number>`\n"
+            "`admin voucher check @user`\n"
+            "`admin quest reset @user`"
         )
 
     # -- cards -----------------------------------------------------------
@@ -57,16 +80,16 @@ class AdminCog(commands.Cog):
         if member.bot:
             await ctx.send("❌ Bots can't own players.")
             return
-        found, err = await asyncio.to_thread(sl.resolve_any, security.clean_input(player))
+        found, err = sl.resolve_any(security.clean_input(player))
         if found is None:
             await ctx.send(f"❌ {err}")
             return
-        if await asyncio.to_thread(economy.give_card, member.id, found["playername_key"]):
+        if economy.give_card(member.id, found["playername_key"]):
             await ctx.send(f"✅ Gave **{esc(found['playername'])}** to {esc(member.display_name)}.")
         else:
             await ctx.send(
                 f"❌ Couldn't give **{esc(found['playername'])}**. "
-                "They haven't debuted yet, or already own this player."
+                "They haven't debuted yet, already own this player, or their squad is full (25)."
             )
 
     # -- coins -----------------------------------------------------------
@@ -92,10 +115,10 @@ class AdminCog(commands.Cog):
         if not -1_000_000_000 <= amount <= 1_000_000_000:
             await ctx.send("❌ Amount too large.")
             return
-        if not await asyncio.to_thread(economy.user_exists, member.id):
+        if not economy.user_exists(member.id):
             await ctx.send("❌ That user hasn't debuted.")
             return
-        bal = await asyncio.to_thread(economy.add_coins, member.id, amount, f"Admin adjustment by {ctx.author.id}")
+        bal = economy.add_coins(member.id, amount, f"Admin adjustment by {ctx.author.id}")
         verb = "received" if amount > 0 else "lost"
         await ctx.send(
             f"✅ {esc(member.display_name)} {verb} **{economy.fmt_coins(abs(amount))}**. "
@@ -114,14 +137,163 @@ class AdminCog(commands.Cog):
         if scope.lower() != "all":
             await ctx.send("Usage: `admin player reset @user all`")
             return
-        if not await asyncio.to_thread(economy.user_exists, member.id):
+        if not economy.user_exists(member.id):
             await ctx.send("❌ That user hasn't debuted.")
             return
-        removed = await asyncio.to_thread(economy.reset_all_cards, member.id)
+        removed = economy.reset_all_cards(member.id)
         await ctx.send(
             f"✅ Removed **{removed}** card(s) from {esc(member.display_name)}. "
             "Their XI and captain were cleared too."
         )
+
+    # -- full reset ------------------------------------------------------
+    @admin.group(name="reset", invoke_without_command=True)
+    @owner_or_admin()
+    async def reset(self, ctx: commands.Context):
+        await ctx.send("Usage: `admin reset all @user`")
+
+    @reset.command(name="all")
+    @owner_or_admin()
+    async def reset_all(self, ctx: commands.Context, member: discord.Member):
+        if member.bot:
+            await ctx.send("❌ Bots don't have an economy.")
+            return
+        if not economy.user_exists(member.id):
+            await ctx.send("❌ That user hasn't debuted.")
+            return
+        res = economy.reset_everything(member.id)
+        await ctx.send(
+            f"✅ Full reset for {esc(member.display_name)}: removed **{res['cards']}** card(s) "
+            f"and **{economy.fmt_coins(res['coins'])}**. Their packs, XI and captain were cleared too."
+        )
+
+    # -- vouchers --------------------------------------------------------
+    # Same rules as csvoucher (draft_cog): owner / full-admin only, main server
+    # only, 1..VOUCHER_ADMIN_MAX per command, logged in voucher_log.
+    @admin.group(name="voucher", invoke_without_command=True)
+    @security.owner_or_admin_role()
+    async def voucher(self, ctx: commands.Context):
+        await ctx.send(
+            "`admin voucher give @user <number>`\n"
+            "`admin voucher remove @user <number>`\n"
+            "`admin voucher check @user`"
+        )
+
+    @staticmethod
+    def _main_guild(ctx: commands.Context) -> bool:
+        return ctx.guild is not None and ctx.guild.id == ADMIN_GUILD_ID
+
+    @voucher.command(name="give")
+    @security.owner_or_admin_role()
+    async def voucher_give(self, ctx: commands.Context, member: discord.Member, amount: int):
+        if not self._main_guild(ctx):
+            return
+        if member.bot:
+            await ctx.send("❌ Bots can't have vouchers.")
+            return
+        if not 1 <= amount <= cfg.VOUCHER_ADMIN_MAX:
+            await ctx.send(f"❌ Give between 1 and {cfg.VOUCHER_ADMIN_MAX:,} vouchers at a time.")
+            return
+        new = economy.add_vouchers(member.id, amount, f"Admin give by {ctx.author.id}")
+        if new is None:
+            await ctx.send("❌ That user hasn't debuted.")
+            return
+        await ctx.send(
+            f"✅ Gave **{amount:,}** {emojis.VOUCHER} to {esc(member.display_name)}. "
+            f"They now have **{new:,}**.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @voucher.command(name="remove")
+    @security.owner_or_admin_role()
+    async def voucher_remove(self, ctx: commands.Context, member: discord.Member, amount: int):
+        if not self._main_guild(ctx):
+            return
+        if not 1 <= amount <= cfg.VOUCHER_ADMIN_MAX:
+            await ctx.send(f"❌ Remove between 1 and {cfg.VOUCHER_ADMIN_MAX:,} vouchers at a time.")
+            return
+        out = economy.remove_vouchers(member.id, amount, f"Admin remove by {ctx.author.id}")
+        if out is None:
+            await ctx.send("❌ That user hasn't debuted.")
+            return
+        removed, new = out
+        await ctx.send(
+            f"✅ Removed **{removed:,}** {emojis.VOUCHER} from {esc(member.display_name)}. "
+            f"They now have **{new:,}**.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @voucher.command(name="check")
+    @security.owner_or_admin_role()
+    async def voucher_check(self, ctx: commands.Context, member: discord.Member):
+        if not self._main_guild(ctx):
+            return
+        if not economy.user_exists(member.id):
+            await ctx.send("❌ That user hasn't debuted.")
+            return
+        have = economy.get_vouchers(member.id)
+        since = economy.get_draft_pity(member.id)
+        left = max(1, cfg.PITY_A_EVERY - since)
+        await ctx.send(
+            f"{emojis.VOUCHER} **{esc(member.display_name)}** has **{have:,}** voucher(s).\n"
+            f"Pool A guaranteed in **{left}** draft(s).",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    # -- quests ----------------------------------------------------------
+    @admin.group(name="quest", invoke_without_command=True)
+    @security.owner_or_admin_role()
+    async def quest_group(self, ctx: commands.Context):
+        await ctx.send("Usage: `admin quest reset @user`")
+
+    @quest_group.command(name="reset")
+    @security.owner_or_admin_role()
+    async def quest_reset(self, ctx: commands.Context, member: discord.Member):
+        if not self._main_guild(ctx):
+            return
+        if not economy.user_exists(member.id):
+            await ctx.send("❌ That user hasn't debuted.")
+            return
+        n = quest.reset_user_today(member.id)
+        await ctx.send(
+            f"✅ Cleared today's quest progress for {esc(member.display_name)} "
+            f"({n} finished quest(s) reset). Vouchers already paid were not taken back.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    # -- user stats ------------------------------------------------------
+    @admin.group(name="user", invoke_without_command=True)
+    @owner_or_admin()
+    async def user(self, ctx: commands.Context):
+        await ctx.send("Usage: `admin user top [20-50] [coins|cards]`")
+
+    @user.command(name="top")
+    @owner_or_admin()
+    async def user_top(self, ctx: commands.Context, count: int = 20, by: str = "coins"):
+        by = by.lower()
+        if by not in ("coins", "cards"):
+            await ctx.send("Usage: `admin user top [20-50] [coins|cards]`")
+            return
+        count = max(1, min(50, count))
+        rows = economy.top_users(count, by)
+        if not rows:
+            await ctx.send("No users yet.")
+            return
+        lines = []
+        for i, r in enumerate(rows, 1):
+            lines.append(
+                f"`{i:>2}.` <@{r['user_id']}> · **{esc(r['team_name'])}**\n"
+                f"      🃏 **{r['cards']}** cards · {economy.fmt_coins(r['purse'])}"
+            )
+        title = f"Top {len(rows)} users by {by}"
+        # 25 users per embed keeps us well under Discord's 4096-char limit.
+        for start in range(0, len(lines), 25):
+            embed = discord.Embed(
+                title=title if start == 0 else f"{title} (cont.)",
+                description="\n".join(lines[start:start + 25]),
+                color=discord.Color.gold(),
+            )
+            await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def setup(bot: commands.Bot):

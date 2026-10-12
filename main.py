@@ -9,6 +9,7 @@ from discord.ext import commands
 
 # Import card_image early to trigger font startup checks
 import card_image as _card_image_startup_check
+import security
 from bot_guard import ADMIN_GUILD_ID, GuardedTree, MaintenancePrefixBlocked, maintenance_prefix_check
 
 # Bot setup
@@ -55,7 +56,8 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     """Text commands blocked by maintenance were already answered: stay quiet. Everything else = default."""
     if isinstance(error, MaintenancePrefixBlocked):
         return
-    await commands.Bot.on_command_error(bot, ctx, error)
+    # security.py turns cooldowns / bad input / bugs into short friendly messages.
+    await security.handle_command_error(ctx, error)
 
 
 async def load_cogs():
@@ -63,11 +65,14 @@ async def load_cogs():
     cog_files = [
         "cardmaker_cog",
         "economy_cog",
+        "draft_cog",
+        "quest_cog",
         "squad_cog",
         "stadium_cog",
         "admin_cog",
         "stats_cog",
         "maintenance_cog",
+        "cooldown_cog",
         # Add other cogs here as needed
     ]
     for cog_name in cog_files:
@@ -86,12 +91,6 @@ async def main():
     
     async with bot:
         await load_cogs()
-        # Load fonts + card templates into RAM once, before the bot goes online.
-        await asyncio.to_thread(_card_image_startup_check.preload_from_db)
-        try:
-            import views  # noqa: F401  (match screens + toss pictures are read into RAM at startup, not on the first match)
-        except Exception as e:
-            print(f"✗ Could not pre-import views: {e}")
         await bot.start(token)
 
 

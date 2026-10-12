@@ -22,6 +22,8 @@ from discord.ext import commands
 
 import card_db
 import economy
+import emojis
+import quest
 import security
 import squad_logic as sl
 import card_cache
@@ -145,6 +147,124 @@ class BuySellView(OwnedView):
         await interaction.response.edit_message(embed=_buysell_embed(self.card, "Cancelled."), view=None)
 
 
+# ── Squad full (25 players): sell the new card or replace one of your players ─
+
+PENDING_TIMEOUT = 120.0
+
+
+class ReplaceSelect(ui.Select):
+    def __init__(self, parent: "PendingCardView", options: list[discord.SelectOption]):
+        super().__init__(placeholder="Pick the player to replace…", min_values=1, max_values=1, options=options)
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.parent_view.finish(interaction, "replace", self.values[0])
+
+
+class PendingCardView(OwnedView):
+    """Shown when a card arrives while the squad is full (25/25)."""
+
+    def __init__(self, user_id: int, card):
+        super().__init__(user_id, timeout=PENDING_TIMEOUT)
+        self.uid = user_id
+        self.card = card
+        self.key = card["playername_key"]
+        self.used = False
+        self.sell.label = f"Sell it (+{sl.sell_value(card):,})"
+
+    @ui.button(label="Sell it", style=discord.ButtonStyle.success, emoji="💰")
+    async def sell(self, interaction: discord.Interaction, button: ui.Button):
+        await self.finish(interaction, "sell")
+
+    @ui.button(label="Replace a player", style=discord.ButtonStyle.primary, emoji="🔁")
+    async def replace(self, interaction: discord.Interaction, button: ui.Button):
+        if self.used:
+            await interaction.response.defer()
+            return
+        cards = sorted(sl.owned_cards(self.uid), key=lambda c: (int(c["ovr"]), c["playername"]))[: economy.SQUAD_MAX]
+        in_xi = set(economy.get_xi(self.uid).values())
+        options = []
+        for c in cards:
+            role = ROLES.get(card_db.effective_role(c), "")
+            desc = f"{role} · sells for {sl.sell_value(c):,}" + (" · in your XI" if c["playername_key"] in in_xi else "")
+            options.append(discord.SelectOption(
+                label=f"{c['playername']} · {c['ovr']} OVR"[:100], value=c["playername_key"], description=desc[:100],
+            ))
+        if not options:
+            await interaction.response.send_message("You have no players to replace.", ephemeral=True)
+            return
+        self.clear_items()
+        self.add_item(ReplaceSelect(self, options))
+        self.add_item(self.later)
+        await interaction.response.edit_message(
+            embed=self._embed("Pick which player this card should replace. The replaced player is sold at their value."),
+            view=self,
+        )
+
+    @ui.button(label="Decide later", style=discord.ButtonStyle.secondary)
+    async def later(self, interaction: discord.Interaction, button: ui.Button):
+        self.used = True
+        self.stop()
+        await interaction.response.edit_message(
+            embed=self._embed("Saved. Use `cspending` whenever you want to decide."), view=None
+        )
+
+    def _embed(self, text: str) -> discord.Embed:
+        embed = _buysell_embed(self.card, text)
+        return embed
+
+    async def finish(self, interaction: discord.Interaction, action: str, replace_key: str | None = None):
+        if self.used:
+            await interaction.response.defer()
+            return
+        if _in_match(interaction.client, self.uid):
+            await interaction.response.send_message("❌ You can't change your squad during a match.", ephemeral=True)
+            return
+        self.used = True
+        self.stop()
+        new_value = sl.sell_value(self.card)
+        old_card = card_db.get_card(replace_key) if replace_key else None
+        old_value = sl.sell_value(old_card) if old_card else 0
+        err = await asyncio.to_thread(
+            economy.resolve_pending, self.uid, self.key, action, replace_key, new_value, old_value
+        )
+        if err:
+            result = f"❌ {err}"
+        elif action == "sell":
+            result = f"💰 Sold **{esc(self.card['playername'])}** for **{_plain_coins(new_value)}**."
+        else:
+            result = (
+                f"🔁 **{esc(self.card['playername'])}** joined your squad and replaced "
+                f"**{esc(old_card['playername'])}** (sold for **{_plain_coins(old_value)}**)."
+            )
+        await interaction.response.edit_message(embed=self._embed(result), view=None)
+        await send_next_pending(interaction.channel, self.uid)
+
+
+async def send_next_pending(dest, user_id: int) -> bool:
+    """Send the prompt for the user's oldest waiting card (if any). One at a time:
+    the next one appears when this one is decided. dest = ctx or a channel."""
+    keys = await asyncio.to_thread(economy.get_pending, user_id)
+    for key in keys:
+        card = card_db.get_card(key)
+        if card is None:
+            continue
+        view = PendingCardView(user_id, card)
+        n = economy.squad_count(user_id)
+        embed = discord.Embed(
+            description=(
+                f"⚠️ **Your squad is full ({n}/{economy.SQUAD_MAX})!**\n"
+                f"New card: **{esc(card['playername'])}** ({card['ovr']} OVR)\n"
+                f"Sell it for **{_plain_coins(sl.sell_value(card))}**, or replace one of your players with it."
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(text="Not now? It stays saved — use cspending later.")
+        view.message = await card_cache.send_embed(dest, embed, card["image_path"], view=view)
+        return True
+    return False
+
+
 # ── Trade offer buttons ──────────────────────────────────────────────────────
 
 class TradeView(OwnedView):
@@ -177,19 +297,22 @@ class TradeView(OwnedView):
         if _in_match(interaction.client, self.proposer.id) or _in_match(interaction.client, self.target.id):
             await interaction.response.edit_message(content="❌ Trade cancelled — a player is in a match.", embed=None, view=None)
             return
-        err = await asyncio.to_thread(
-            economy.execute_trade, self.proposer.id, self.give_key, self.target.id, self.get_key
-        )
+        a_card, b_card = card_db.get_card(self.give_key), card_db.get_card(self.get_key)
+        if a_card is None or b_card is None or int(a_card["ovr"]) != int(b_card["ovr"]):
+            await interaction.response.edit_message(
+                content="❌ Trade cancelled — the two players no longer have the same OVR.", embed=None, view=None
+            )
+            return
+        err = economy.execute_trade(self.proposer.id, self.give_key, self.target.id, self.get_key)
         if err:
             await interaction.response.edit_message(content=f"❌ Trade failed: {err}", embed=None, view=None)
             return
-        gave, got = await asyncio.to_thread(
-            lambda: (card_db.get_card(self.give_key), card_db.get_card(self.get_key))
-        )
+        gave, got = card_db.get_card(self.give_key), card_db.get_card(self.get_key)
         await interaction.response.edit_message(
             content=(
                 f"🤝 Trade complete! {esc(self.proposer.display_name)} gave **{esc(gave['playername'])}** "
-                f"and received **{esc(got['playername'])}** from {esc(self.target.display_name)}."
+                f"and received **{esc(got['playername'])}** from {esc(self.target.display_name)}.\n"
+                f"💸 Trade fee: **{economy.TRADE_FEE:,} coins** paid by each of you."
             ),
             embed=None, view=None,
         )
@@ -208,53 +331,10 @@ class TradeView(OwnedView):
 
 # Custom emojis for the reward messages (developer-portal emojis).
 REWARD_EMOJI = {
-    "daily":   "<:Daily:1554697281855430666>",
-    "weekly":  "<:Weeklypack:1554697293092094065>",
-    "monthly": "<:Monthlypack:1554698034800099369>",
+    "daily":   "<:Dailypack:1558139740786528368>",
+    "weekly":  "<:Weeklypack:1558138384675905536>",
+    "monthly": "<:Monthlypack:1558138440208486440>",
 }
-
-
-def _claim_sync(uid: int, kind: str, lo: int, hi: int):
-    """All the blocking DB work of a reward claim (runs in a worker thread)."""
-    pool = [c for c in card_db.list_all_cards() if lo <= int(c["ovr"]) <= hi]
-    res = economy.claim_reward(
-        uid, kind,
-        [c["playername_key"] for c in pool],
-        {c["playername_key"]: sl.sell_value(c) for c in pool},
-    )
-    card = card_db.get_card(res["card"]) if res.get("ok") and res.get("card") else None
-    return res, card
-
-
-def _sell_sync(uid: int, key: str, value: int) -> str | None:
-    """Sell flow incl. picking the bench replacement (runs in a worker thread)."""
-    xi_keys = set(economy.get_xi(uid).values())
-    replacement = None
-    if key in xi_keys:
-        bench = [c for c in sl.owned_cards(uid) if c["playername_key"] not in xi_keys]
-        if bench:
-            replacement = max(bench, key=lambda c: c["ovr"])["playername_key"]
-    return economy.sell_card(uid, key, value, replacement)
-
-
-def _leaderboard_sync(board: str):
-    """Build leaderboard rows (runs in a worker thread: loops over every user's XI)."""
-    users = [u for u in economy.list_users() if not security.is_banned(u["user_id"])]
-    rows = []
-    if board == "coins":
-        for u in sorted(users, key=lambda u: -u["purse"])[:10]:
-            rows.append((u["team_name"], economy.fmt_coins(u["purse"])))
-        title = "💰 Richest teams"
-    else:
-        scored = []
-        for u in users:
-            cards = sl.xi_cards(u["user_id"])
-            if len(cards) == economy.XI_SIZE:
-                scored.append((sl.average_ovr(cards), u["team_name"]))
-        for ovr, name in sorted(scored, reverse=True)[:10]:
-            rows.append((name, f"OVR {ovr}"))
-        title = "🏆 Strongest XIs"
-    return rows, title
 
 
 class EconomyCog(commands.Cog, name="Economy"):
@@ -265,16 +345,14 @@ class EconomyCog(commands.Cog, name="Economy"):
     @commands.command(name="csbal")
     @economy_cooldown()
     async def csbal(self, ctx: commands.Context):
-        """Show your coins and unopened packs."""
+        """Show your coins and vouchers."""
         if not await _need_debut(ctx):
             return
-        packs, balance = await asyncio.to_thread(
-            lambda uid: (economy.get_packs(uid), economy.get_balance(uid)), ctx.author.id
-        )
-        pack_txt = ", ".join(f"{sl.PACKS[t]['emoji']} {n}× {sl.PACKS[t]['label']}" for t, n in packs.items() if t in sl.PACKS)
+        coins = economy.get_balance(ctx.author.id)
+        vouchers = economy.get_vouchers(ctx.author.id)
         await ctx.send(
-            f"💰 Purse: **{economy.fmt_coins(balance)}**"
-            + (f"\n📦 Unopened: {pack_txt}" if pack_txt else "")
+            f"Purse: **{economy.fmt_coins(coins)}**\n"
+            f"{emojis.VOUCHER} Vouchers: **{vouchers:,}**"
         )
 
     # -- rewards ---------------------------------------------------------
@@ -285,7 +363,12 @@ class EconomyCog(commands.Cog, name="Economy"):
             await ctx.send("💎 The weekly reward is for **Premium members** only.")
             return
         lo, hi = economy.REWARD_CARD_OVR[kind]
-        res, reward_card = await asyncio.to_thread(_claim_sync, ctx.author.id, kind, lo, hi)
+        pool = [c for c in card_db.list_all_cards() if lo <= int(c["ovr"]) <= hi]
+        res = economy.claim_reward(
+            ctx.author.id, kind,
+            [c["playername_key"] for c in pool],
+            {c["playername_key"]: sl.sell_value(c) for c in pool},
+        )
         if not res["ok"]:
             if res.get("locked"):
                 await ctx.send(
@@ -296,6 +379,8 @@ class EconomyCog(commands.Cog, name="Economy"):
             await ctx.send(f"⏳ You already claimed your {kind} reward. Come back in **{fmt_wait(res['wait'])}**.")
             return
         lines = [f"{REWARD_EMOJI.get(kind, '🎁')} {kind.title()} reward: **+{economy.fmt_coins(res['coins'])}**"]
+        if kind == "weekly" and res.get("vouchers"):
+            lines.append(f"{emojis.VOUCHER} Weekly vouchers: **+{res['vouchers']}**")
         if kind == "daily":
             streak = res["streak"]
             if res["bonus"]:
@@ -303,21 +388,29 @@ class EconomyCog(commands.Cog, name="Economy"):
                     f"🎉 Streak bonus: **+{economy.fmt_coins(res['bonus'])}** "
                     f"(daily {economy.fmt_coins(res['base'])} + streak {economy.fmt_coins(res['bonus'])})"
                 )
+            if res.get("vouchers"):
+                lines.append(f"{emojis.VOUCHER} {streak}-day streak reward: **+{res['vouchers']} vouchers**")
             nxt = economy.STREAK_EVERY - streak % economy.STREAK_EVERY
             lines.append(
-                f"🔥 Streak: **{streak}** day(s) — next streak bonus in **{nxt}** day(s). "
+                f"<:Streak:1558139736617390292> Streak: **{streak}** day(s) — next {economy.STREAK_VOUCHERS} vouchers in **{nxt}** day(s). "
                 f"Miss a day and it restarts from 1!"
             )
         if res["card"]:
-            card = reward_card
+            card = card_db.get_card(res["card"])
             if res["dupe"]:
                 lines.append(f"🎴 {_card_line(card, '  ♻️ duplicate')} → **+{economy.fmt_coins(res['refund'])}**")
+            elif res.get("pending"):
+                lines.append(f"🎴 {_card_line(card, '  ⚠️ squad full')} — choose below: sell it or replace a player.")
             else:
                 lines.append(f"🎴 New player: {_card_line(card, '  🆕')}")
         else:
             lines.append(f"🎴 No player cards with rating {lo}-{hi} are available yet.")
         lines.append(f"Balance: **{economy.fmt_coins(res['balance'])}**")
         await ctx.send("\n".join(lines))
+        if res.get("pending"):
+            await send_next_pending(ctx, ctx.author.id)
+        if kind == "daily":
+            await quest.track_and_notify(ctx, ctx.author.id, {"daily_claim": 1})
 
     @commands.command(name="csdaily")
     @economy_cooldown()
@@ -336,6 +429,51 @@ class EconomyCog(commands.Cog, name="Economy"):
     async def csmonthly(self, ctx: commands.Context):
         """Claim monthly coins + a random 85-88 player."""
         await self._claim(ctx, "monthly")
+
+    # -- csclaim: free card every hour (Premium: every 35 min) -------------
+    @commands.command(name="csclaim")
+    @economy_cooldown()
+    async def csclaim(self, ctx: commands.Context):
+        """Claim a free random player card every hour (Premium: every 35 min)."""
+        if not await _need_debut(ctx):
+            return
+        premium = _is_premium(ctx.author)
+        cooldown = economy.CLAIM_COOLDOWN_PREMIUM if premium else economy.CLAIM_COOLDOWN
+        by_ovr: dict[int, list[str]] = {}
+        values: dict[str, int] = {}
+        for c in card_db.list_all_cards():
+            by_ovr.setdefault(int(c["ovr"]), []).append(c["playername_key"])
+            values[c["playername_key"]] = sl.sell_value(c)
+        res = await asyncio.to_thread(economy.claim_card, ctx.author.id, cooldown, by_ovr, values)
+        if not res["ok"]:
+            if res.get("empty"):
+                await ctx.send("🎴 No player cards are available to claim yet. Try again later.")
+                return
+            msg = f"⏳ Your next card is ready in **{fmt_wait(res['wait'])}**."
+            if not premium:
+                msg += "\n💎 Premium members can claim every **35 min**."
+            await ctx.send(msg)
+            return
+
+        card = card_db.get_card(res["card"])
+        ovr = int(card["ovr"])
+        if res["dupe"]:
+            body = f"{_card_line(card, '  ♻️ duplicate')}\n💰 Sold automatically for **+{economy.fmt_coins(res['refund'])}**"
+        elif res["pending"]:
+            body = f"{_card_line(card, '  ⚠️ squad full')}\nChoose below: sell it or replace a player."
+        else:
+            body = _card_line(card, "  🆕")
+        if ovr >= 84:
+            title, color = "🌟 Rare Claim!", discord.Color.purple()
+        elif ovr >= 76:
+            title, color = "🎴 Hourly Claim", discord.Color.blue()
+        else:
+            title, color = "🎴 Hourly Claim", discord.Color.light_grey()
+        embed = discord.Embed(title=title, description=body, color=color)
+        embed.set_footer(text=f"Next claim in {fmt_wait(cooldown)}" + (" • 💎 Premium" if premium else ""))
+        await card_cache.send_embed(ctx, embed, card["image_path"])   # card image comes with the message
+        if res["pending"]:
+            await send_next_pending(ctx, ctx.author.id)
 
     # -- packs -----------------------------------------------------------
     @commands.command(name="cspack")
@@ -360,9 +498,10 @@ class EconomyCog(commands.Cog, name="Economy"):
         uid = ctx.author.id
 
         async def do_buy() -> str:
-            err = await asyncio.to_thread(economy.buy_pack, uid, key, spec["price"])
+            err = economy.buy_pack(uid, key, spec["price"])
             if err:
                 return f"❌ {err}"
+            await quest.track_and_notify(ctx.channel, uid, {"packs_bought": 1})
             return (
                 f"✅ Bought 1× {spec['emoji']} {spec['label']} for {economy.fmt_coins(spec['price'])}. "
                 f"Open it with `csopen {key}`."
@@ -382,7 +521,7 @@ class EconomyCog(commands.Cog, name="Economy"):
         if _in_match(self.bot, ctx.author.id):
             await ctx.send("❌ You can't open packs during a match.")
             return
-        have = await asyncio.to_thread(economy.get_packs, ctx.author.id)
+        have = economy.get_packs(ctx.author.id)
         have = {k: v for k, v in have.items() if k in sl.PACKS}
         if not have:
             await ctx.send("You have no packs. Buy them with `cspack`.")
@@ -397,12 +536,11 @@ class EconomyCog(commands.Cog, name="Economy"):
         if key not in have:
             await ctx.send("❌ You don't have that pack.")
             return
-        rolled = await asyncio.to_thread(sl.roll_pack, key)
+        rolled = sl.roll_pack(key)
         if not rolled:
             await ctx.send("⚠️ There are no player cards in the game yet, so packs can't open. Ask the owner to add cards.")
             return
-        result = await asyncio.to_thread(
-            economy.open_pack,
+        result = economy.open_pack(
             ctx.author.id, key,
             [c["playername_key"] for c in rolled],
             {c["playername_key"]: sl.sell_value(c) for c in rolled},
@@ -412,12 +550,16 @@ class EconomyCog(commands.Cog, name="Economy"):
             return
         by_key = {c["playername_key"]: c for c in rolled}
         lines = [_card_line(by_key[k], "  🆕") for k in result["new"]]
+        lines += [_card_line(by_key[k], "  ⚠️ squad full") for k in result.get("pending", [])]
         lines += [_card_line(by_key[k], "  ♻️ duplicate") for k in result["dupes"]]
         spec = sl.PACKS[key]
         embed = discord.Embed(title=f"{spec['emoji']} {spec['label']} opened!", description="\n".join(lines), color=discord.Color.gold())
         if result["refund"]:
             embed.set_footer(text=f"Duplicates gave you back {result['refund']:,} coins")
         await ctx.send(embed=embed)
+        if result.get("pending"):
+            await send_next_pending(ctx, ctx.author.id)
+        await quest.track_and_notify(ctx, ctx.author.id, {"packs_opened": 1})
 
     # -- buy / sell ------------------------------------------------------
     @commands.command(name="csbuy")
@@ -433,24 +575,23 @@ class EconomyCog(commands.Cog, name="Economy"):
         if card is None:
             await ctx.send(str(err))
             return
-        owns_it, coins_now = await asyncio.to_thread(
-            lambda uid, k: (economy.owns(uid, k), economy.get_balance(uid)),
-            ctx.author.id, card["playername_key"],
-        )
-        if owns_it:
+        if economy.owns(ctx.author.id, card["playername_key"]):
             await ctx.send("You already own this player.")
+            return
+        if economy.squad_count(ctx.author.id) >= economy.SQUAD_MAX:
+            await ctx.send(f"❌ Your squad is full (**{economy.SQUAD_MAX}/{economy.SQUAD_MAX}**). Sell a player first with `cssell`.")
             return
         price = sl.buy_price(card)
         uid, key = ctx.author.id, card["playername_key"]
 
         async def do_buy() -> str:
-            e = await asyncio.to_thread(economy.buy_card, uid, key, price)
+            e = economy.buy_card(uid, key, price)
             return str(e) if e else f"Bought {esc(card['playername'])} for {_plain_coins(price)}."
 
         await _send_buysell(
             ctx, card,
             f"Buy {esc(card['playername'])} ({card['ovr']} OVR) for {_plain_coins(price)}?\n"
-            f"Your coins: {_plain_coins(coins_now)}",
+            f"Your coins: {_plain_coins(economy.get_balance(uid))}",
             do_buy,
         )
 
@@ -472,7 +613,13 @@ class EconomyCog(commands.Cog, name="Economy"):
 
         async def do_sell() -> str:
             # If this player is in the XI, the best bench player takes their place.
-            e = await asyncio.to_thread(_sell_sync, uid, key, value)
+            xi_keys = set(economy.get_xi(uid).values())
+            replacement = None
+            if key in xi_keys:
+                bench = [c for c in sl.owned_cards(uid) if c["playername_key"] not in xi_keys]
+                if bench:
+                    replacement = max(bench, key=lambda c: c["ovr"])["playername_key"]
+            e = economy.sell_card(uid, key, value, replacement)
             return str(e) if e else f"Sold {esc(card['playername'])} for {_plain_coins(value)}."
 
         await _send_buysell(
@@ -481,12 +628,25 @@ class EconomyCog(commands.Cog, name="Economy"):
             do_sell,
         )
 
+    # -- cards waiting because the squad was full ---------------------------
+    @commands.command(name="cspending")
+    @economy_cooldown()
+    async def cspending(self, ctx: commands.Context):
+        """Cards that arrived while your squad was full (25): sell them or replace a player."""
+        if not await _need_debut(ctx):
+            return
+        if _in_match(self.bot, ctx.author.id):
+            await ctx.send("❌ You can't change your squad during a match.")
+            return
+        if not await send_next_pending(ctx, ctx.author.id):
+            await ctx.send(f"✅ No cards are waiting. Squad: **{economy.squad_count(ctx.author.id)}/{economy.SQUAD_MAX}**.")
+
     # -- trade -----------------------------------------------------------
     @commands.command(name="cstrade")
     @economy_cooldown()
     @commands.cooldown(1, 15, commands.BucketType.user)
     async def cstrade(self, ctx: commands.Context, member: discord.Member, *, players: str):
-        """Trade players: `cstrade @user my player | their player`."""
+        """Trade players of the SAME OVR (5,000 coins fee each): `cstrade @user my player | their player`."""
         if not await _need_debut(ctx):
             return
         if member.bot or member.id == ctx.author.id:
@@ -495,7 +655,7 @@ class EconomyCog(commands.Cog, name="Economy"):
         if security.is_banned(member.id):
             await ctx.send("❌ You can't trade with that user.")
             return
-        if not await asyncio.to_thread(economy.user_exists, member.id):
+        if not economy.user_exists(member.id):
             await ctx.send(f"❌ {esc(member.display_name)} hasn't debuted yet.")
             return
         if ctx.author.id in _pending_trade or member.id in _pending_trade:
@@ -509,20 +669,29 @@ class EconomyCog(commands.Cog, name="Economy"):
             await ctx.send("Usage: `cstrade @user Your Player | Their Player`")
             return
         mine_txt, theirs_txt = (p.strip() for p in players.split("|"))
-        mine, err = await asyncio.to_thread(sl.resolve_owned, ctx.author.id, mine_txt)
+        mine, err = sl.resolve_owned(ctx.author.id, mine_txt)
         if mine is None:
             await ctx.send(f"❌ {err}")
             return
-        theirs, err = await asyncio.to_thread(sl.resolve_owned, member.id, theirs_txt)
+        theirs, err = sl.resolve_owned(member.id, theirs_txt)
         if theirs is None:
             await ctx.send(f"❌ {esc(member.display_name)} doesn't own a player like that.")
             return
-        already = await asyncio.to_thread(
-            lambda: economy.owns(member.id, mine["playername_key"]) or economy.owns(ctx.author.id, theirs["playername_key"])
-        )
-        if already:
+        if economy.owns(member.id, mine["playername_key"]) or economy.owns(ctx.author.id, theirs["playername_key"]):
             await ctx.send("❌ One of you already owns the player you'd receive.")
             return
+        if int(mine["ovr"]) != int(theirs["ovr"]):
+            await ctx.send(
+                f"❌ Trades are only allowed between players with the **same OVR**.\n"
+                f"{esc(mine['playername'])} is **{mine['ovr']}** OVR, "
+                f"{esc(theirs['playername'])} is **{theirs['ovr']}** OVR."
+            )
+            return
+        fee = economy.TRADE_FEE
+        for who in (ctx.author, member):
+            if economy.get_balance(who.id) < fee:
+                await ctx.send(f"❌ {esc(who.display_name)} needs **{fee:,} coins** for the trade fee (every trade costs {fee:,} coins each).")
+                return
         _pending_trade.update({ctx.author.id, member.id})
         view = TradeView(ctx.author, member, mine["playername_key"], theirs["playername_key"])
         embed = discord.Embed(
@@ -533,7 +702,7 @@ class EconomyCog(commands.Cog, name="Economy"):
             ),
             color=discord.Color.orange(),
         )
-        embed.set_footer(text=f"{member.display_name}: press Accept within 60 seconds")
+        embed.set_footer(text=f"Same OVR ✔ · Fee: {fee:,} coins each (paid when accepted) · {member.display_name}: press Accept within 60 seconds")
         view.message = await ctx.send(content=member.mention, embed=embed, view=view)
 
     # -- leaderboard -----------------------------------------------------
@@ -545,13 +714,27 @@ class EconomyCog(commands.Cog, name="Economy"):
         if board not in ("ovr", "coins"):
             await ctx.send("Use `csleaderboard ovr` or `csleaderboard coins`.")
             return
-        rows, title = await asyncio.to_thread(_leaderboard_sync, board)
+        users = [u for u in economy.list_users() if not security.is_banned(u["user_id"])]
+        rows = []
+        if board == "coins":
+            for u in sorted(users, key=lambda u: -u["purse"])[:10]:
+                rows.append((u["team_name"], economy.fmt_coins(u["purse"])))
+            title = "<:CSCoin:1558139683702055062> Richest teams"
+        else:
+            scored = []
+            for u in users:
+                cards = sl.xi_cards(u["user_id"])
+                if len(cards) == economy.XI_SIZE:
+                    scored.append((sl.average_ovr(cards), u["team_name"]))
+            for ovr, name in sorted(scored, reverse=True)[:10]:
+                rows.append((name, f"OVR {ovr}"))
+            title = "<:OVR:1558139691482751066> Strongest XIs"
         if not rows:
             await ctx.send("No teams on the leaderboard yet.")
             return
-        medals = ["🥇", "🥈", "🥉"]
-        lines = [f"{medals[i] if i < 3 else f'`{i + 1}.`'} **{esc(n)}** — {v}" for i, (n, v) in enumerate(rows)]
+        lines = [f"`{i + 1}.` **{esc(n)}** — {v}" for i, (n, v) in enumerate(rows)]
         await ctx.send(embed=discord.Embed(title=title, description="\n".join(lines), color=discord.Color.gold()))
+        await quest.track_and_notify(ctx, ctx.author.id, {"lb_view": 1})
 
 
 async def setup(bot: commands.Bot):

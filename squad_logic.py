@@ -10,6 +10,7 @@ import math
 import secrets
 
 import card_db
+import emojis
 import economy
 from card_narratives import ENGINE_ROLE, ROLES
 
@@ -43,7 +44,7 @@ def tier_of(ovr: int) -> str:
     return "common"
 
 
-TIER_EMOJI = {"elite": "🥇", "rare": "🥈", "common": "🥉"}
+TIER_EMOJI = {"elite": "", "rare": "", "common": ""}   # medal emojis removed everywhere
 
 
 def card_emoji(card) -> str:
@@ -53,13 +54,15 @@ def card_emoji(card) -> str:
 # Custom role emojis (uploaded in the Discord developer portal, so the bot can
 # use them in any server). Pick by role + bowling type.
 ROLE_EMOJI = {
-    "WK":       "<:Wicketkeeper:1518961376884822087>",
-    "BAT":      "<:Batsman:1518862731103436900>",
-    "AR":       "<:AllRounder2:1518961183963484272>",
-    "Fast":     "<:FastBowler3:1518961249826766879>",
-    "Off Spin": "<:Offspin4:1518961309981610145>",
-    "Leg Spin": "<:Legspinner:1518862597208801502>",
-    "BOWL":     "<:Normalnall:1518862733423022090>",   # bowler, unknown type
+    "WK":           emojis.WICKETKEEPER,
+    "BAT":          emojis.BATTER,
+    "AR":           emojis.ALLROUNDER,
+    "Fast":         emojis.PACER,
+    "Off Spin":     emojis.OFFSPIN,
+    "Leg Spin":     emojis.LEGSPIN,
+    "Orthodox":     emojis.OFFSPIN,        # no dedicated emoji yet
+    "Medium Pacer": emojis.MEDIUMPACER,
+    "BOWL":         emojis.PACER,          # bowler, unknown type
 }
 
 
@@ -255,24 +258,24 @@ def best_xi(cards: list) -> list:
 
 
 def pick_starter_squad() -> list | None:
-    """13 modest cards (no top stars): 5 batters, 1 keeper, 2 all-rounders,
-    5 bowlers. Falls back to any cards if the pool is small. None if there
-    aren't even 11 cards in the game yet."""
+    """Exactly 11 modest cards (no top stars) that already form a legal XI:
+    1 keeper, 4 batters, 2 all-rounders, 4 bowlers. Falls back to any cards
+    if the pool is small. None if there aren't even 11 cards in the game yet."""
     cards = card_db.list_all_cards()
     if len(cards) < economy.XI_SIZE:
         return None
     modest = [c for c in cards if c["ovr"] <= 82] or list(cards)
-    want = {"BAT": 5, "WK": 1, "AR": 2, "BOWL": 5}
+    want = {"BAT": 4, "WK": 1, "AR": 2, "BOWL": 4}
     chosen: list = []
     for role, n in want.items():
         pool = [c for c in modest if card_db.effective_role(c) == role and c not in chosen]
         _rng.shuffle(pool)
         chosen.extend(pool[:n])
-    if len(chosen) < 13:
+    if len(chosen) < economy.XI_SIZE:
         rest = [c for c in cards if c not in chosen]
         rest.sort(key=lambda c: (abs(c["ovr"] - 72), _rng.random()))
-        chosen.extend(rest[: 13 - len(chosen)])
-    return chosen[:13] if len(chosen) >= economy.XI_SIZE else None
+        chosen.extend(rest[: economy.XI_SIZE - len(chosen)])
+    return chosen[: economy.XI_SIZE] if len(chosen) >= economy.XI_SIZE else None
 
 
 # ── Reading a user's squad ───────────────────────────────────────────────────
@@ -400,6 +403,37 @@ def build_match_team(user_id) -> dict:
         "players": players,
         "captain": captain,
     }
+
+
+def impact_sub_cards(user_id) -> list:
+    """Card rows for this user's nominated Impact Player subs, in slot order."""
+    subs = economy.get_impact_subs(user_id)
+    out = []
+    for slot in sorted(subs):
+        card = card_db.get_card(subs[slot])
+        if card is not None:
+            out.append(card)
+    return out
+
+
+def build_impact_subs_players(user_id) -> list[dict]:
+    """Same per-player dict shape as build_match_team()'s players list, for
+    this user's nominated Impact Player subs. Used to fill the bench pool a
+    live match draws from when the Impact Player button is used."""
+    cards = impact_sub_cards(user_id)
+    return [
+        {
+            "name": c["playername"],
+            "country": c["country"],
+            "ovr": c["ovr"],
+            "bat": c["bat"],
+            "bowl": c["bowl"],
+            "bowling_type": card_db.effective_bowling_type(c),
+            "role": ENGINE_ROLE[card_db.effective_role(c)],
+            "card": card_emoji(c),
+        }
+        for c in cards
+    ]
 
 
 # ── Finding a player by what the user typed ──────────────────────────────────

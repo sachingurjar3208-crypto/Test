@@ -216,6 +216,8 @@ class GameState:
         self.batsman_stats: dict[str, dict] = {}
         self.bowler_stats: dict[str, dict] = {}
         self.dismissed: list[str] = []
+        self.inn1_snapshot: dict | None = None
+        self.match_record_id: int | None = None
         self.bowler_ball_count: dict[str, int] = {}
         self.bowler_maidens: dict[str, int] = {}
         self.last_over_bowler: str | None = None
@@ -269,6 +271,13 @@ class GameState:
         self.swap_used: dict[int, bool] = {}
         self.sub_in_used: dict[int, set[str]] = {}
         self.bowlers_introduced: set[int] = set()
+
+        # Impact Player: each team may bring on ONE nominated bench sub,
+        # once, for the whole match. impact_subs_pool[uid] is that team's
+        # available bench subs (consumed from as they're used);
+        # impact_used[uid] flips True the moment they use their one swap.
+        self.impact_subs_pool: dict[int, list[dict]] = {}
+        self.impact_used: dict[int, bool] = {}
 
         # Last-ball wicket tracking (for IPL-style Impact: auto-replace dismissed batter)
         self.last_ball_was_wicket: bool = False
@@ -830,6 +839,27 @@ class GameState:
             available.append(p)
         return available
 
+    # ── Impact Player ────────────────────────────────────────────────────
+    def impact_available(self, uid: int) -> bool:
+        """True if this team still has an unused Impact Player sub to bring on."""
+        return bool(self.impact_subs_pool.get(uid)) and not self.impact_used.get(uid, False)
+
+    def apply_impact_sub(self, uid: int, incoming: dict, outgoing_name: str) -> bool:
+        """Bring `incoming` (a bench sub) into `uid`'s XI in place of the
+        player named `outgoing_name`. Uses up this team's one Impact Player
+        swap for the match. Returns True on success, False if the outgoing
+        player couldn't be found in the team."""
+        team = self.teams.get(uid)
+        players = self._team_players(team)
+        idx = next((i for i, p in enumerate(players) if _pname(p) == outgoing_name), None)
+        if idx is None:
+            return False
+        players[idx] = incoming
+        self.impact_used[uid] = True
+        pool = self.impact_subs_pool.get(uid, [])
+        self.impact_subs_pool[uid] = [p for p in pool if _pname(p) != _pname(incoming)]
+        return True
+
     def is_innings_over(self) -> bool:
         if self.current_wickets >= 10:
             return True
@@ -840,6 +870,16 @@ class GameState:
         return False
 
     def start_second_innings(self) -> None:
+        # Keep innings-1 stats for the end-of-match summary card (they are reset below).
+        import copy as _copy
+        self.inn1_snapshot = {
+            "batsman_stats": _copy.deepcopy(self.batsman_stats),
+            "bowler_stats": _copy.deepcopy(self.bowler_stats),
+            "bowler_ball_count": dict(self.bowler_ball_count),
+            "maidens": dict(self.bowler_maidens),
+            "dismissed": list(self.dismissed),
+            "overs": self.overs_str(),
+        }
         self.batting_user_id, self.bowling_user_id = (
             self.bowling_user_id,
             self.batting_user_id,
