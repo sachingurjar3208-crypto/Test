@@ -34,7 +34,7 @@ _rng = secrets.SystemRandom()
 
 # ── Tunable numbers ──────────────────────────────────────────────────────────
 RANKED_OVERS = 8             # every ranked match is exactly this many overs
-BOT_WAIT_SECONDS = 60        # nobody found for this long -> a bot opponent plays
+BOT_WAIT_SECONDS = 10        # nobody found for this long -> a bot opponent plays
 SEARCH_TIMEOUT = 300         # global search gives up after 5 minutes (only if no bot can be made)
 
 # Bronze players get the season coin reward even if they never played ranked

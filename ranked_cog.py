@@ -168,7 +168,7 @@ class RankedCog(commands.Cog, name="Ranked"):
 
         t = ranked.tier_emoji(tier)
         entry.message = await ctx.send(
-            f"🔎 Searching for a {t} **{tier}** opponent… (up to {ranked.SEARCH_TIMEOUT // 60} min)\n"
+            f"🔎 Searching for a {t} **{tier}** opponent… (a bot plays you after {ranked.BOT_WAIT_SECONDS} sec)\n"
             f"Ranked: **{ranked.RANKED_OVERS} overs** • win **+1 ⭐** • lose **-1 ⭐**",
             view=_SearchView(self, entry),
         )

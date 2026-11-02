@@ -1,0 +1,20 @@
+FIX (csmp ranked "Something went wrong")
+========================================
+
+Wajah: naye match test bot ki files (bot.py, engine.py, players.py, render.py, ui.py,
+README.txt) is repo ke ROOT folder mein daal di gayi thi. Test bot ki engine.py ne main
+bot ki engine.py ko overwrite kar diya. Match shuru hote hi game.py engine.py se
+get_cricket_stats / apply_shiny_boost ... maangta hai, wo mile nahi -> error ->
+"Something went wrong".
+
+Kya kiya:
+  * engine.py  -> main bot wali asli engine.py wapas lagayi
+  * test bot ki saari files ab alag folder mein: match_test/
+      (match_test/bot.py, engine.py, ui.py, render.py, players.py, fonts/, data/)
+    Test bot chalana ho:  cd match_test  &&  python bot.py   (apni .env ke saath)
+  * requirements.txt -> main bot wali wapas (+ python-dotenv)
+  * ranked.py: BOT_WAIT_SECONDS = 10  -> csmp ranked mein 10 sec tak koi player na mile
+    to bot ke saath match shuru
+  * ranked_cog.py: search message mein "a bot plays you after 10 sec" likha aata hai
+
+Dhyan: dono bot ek hi folder ke ROOT mein mat rakhna, files ke naam takrate hain.
